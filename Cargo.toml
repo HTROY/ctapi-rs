@@ -1,0 +1,11 @@
+[workspace]
+
+members = [
+  "ctapi-sys", 
+  "ctapi-rs",
+  "examples/*"
+  ]
+
+#default-members = ["ctapi-rs"]
+
+resolver = "2"
