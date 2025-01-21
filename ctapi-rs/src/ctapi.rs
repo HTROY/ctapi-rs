@@ -182,7 +182,7 @@ impl<'a> CtList<'a> {
     /// is already pending, the tag will not be read until the next time ctListRead()
     /// is called. ctListWrite() may be called immediately after the ctListAdd()
     /// function has completed.
-    pub fn add<T: AsRef<str>>(&mut self, tag: T) -> Result<()> {
+    pub fn add_tag<T: AsRef<str>>(&mut self, tag: T) -> Result<()> {
         let ctag = CString::new(GBK.encode(tag.as_ref()).0)?;
         unsafe {
             let handle = ctListAdd(self.handle, ctag.as_ptr());
@@ -203,7 +203,7 @@ impl<'a> CtList<'a> {
     /// If ctListAdd is called instead of ctListAddEx, The poll period of the subscription for
     /// the tag defaults to 500 milliseconds, and the bRaw flag defaults to the engineering
     /// value of FALSE.
-    pub fn add_ex<T: AsRef<str>>(
+    pub fn add_tag_ex<T: AsRef<str>>(
         &mut self,
         tag: T,
         raw: bool,
@@ -224,7 +224,7 @@ impl<'a> CtList<'a> {
     /// Frees a tag created with ctListAdd. Your program is permitted to call ctListDelete() while
     /// a read or write is pending on another thread. The ctListWrite() and ctListRead() will
     /// return once the tag has been deleted.
-    pub fn delete<T: AsRef<str>>(&mut self, tag: T) -> Result<()> {
+    pub fn delete_tag<T: AsRef<str>>(&mut self, tag: T) -> Result<()> {
         match self.tag_map.get(tag.as_ref()) {
             Some(handle) => {
                 unsafe {
@@ -271,7 +271,7 @@ impl<'a> CtList<'a> {
     /// pending, and the last data read will be returned. If you wish to get the value of a
     /// specific quality part of a tag element item data use ctListItem which includes the same
     /// parameters with the addition of the dwItem parameter.
-    pub fn data<T: AsRef<str>>(&self, tag: T, mode: u32) -> Result<String> {
+    pub fn read_tag<T: AsRef<str>>(&self, tag: T, mode: u32) -> Result<String> {
         match self.tag_map.get(tag.as_ref()) {
             Some(handle) => unsafe {
                 let mut buffer = [0u8; 256];
@@ -293,7 +293,7 @@ impl<'a> CtList<'a> {
     }
 
     /// Writes to a single tag on the list.
-    pub fn write<T: AsRef<str>>(
+    pub fn write_tag<T: AsRef<str>>(
         &self,
         tag: T,
         value: T,
@@ -981,10 +981,10 @@ mod tests {
         let mut client = CtClient::open(Some(COMPUTER), Some(USER), Some(PASSWORD), 0).unwrap();
         let mut list = client.list_new(0).unwrap();
         //drop(client);
-        list.add("BIT_1").unwrap();
+        list.add_tag("BIT_1").unwrap();
         list.read().unwrap();
-        println!("{}", list.data("BIT_1", 0).unwrap());
-        let v = list.delete("BIT_1");
+        println!("{}", list.read_tag("BIT_1", 0).unwrap());
+        let v = list.delete_tag("BIT_1");
         println!("{:?}", v);
     }
 
