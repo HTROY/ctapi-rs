@@ -10,7 +10,7 @@ anyhow = "1"
 ctapi-sys = { path = "../ctapi-sys", version = "0.1.0" }
 encoding_rs = "0.8"
 libc = "0.2"
-thiserror = "1"
+thiserror = "2"
 
 [dev-dependencies]
 chrono = "~0.4"
