@@ -1,0 +1,13 @@
+[package]
+name = "list-read"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1"
+ctapi-rs = { path = "../../ctapi-rs", version = "0.2.0" }
+encoding_rs = "0.8"
+libc = "0.2"
+
+[dev-dependencies]
+chrono = "~0.4"
