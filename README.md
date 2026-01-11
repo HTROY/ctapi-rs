@@ -15,6 +15,8 @@ ctapi-rs 是一个安全、高性能的 Rust 库，用于与 Citect SCADA 系统
 - 🔧 **易于使用**: 简洁的 API 设计，支持现代 Rust 最佳实践
 - 🔄 **错误处理**: 强类型错误系统，提供详细的错误信息
 - 🌏 **编码支持**: 完整的 GBK/UTF-8 编码转换支持
+- ⚡ **异步操作**: 基于 OVERLAPPED I/O 的非阻塞异步 API
+- 🦀 **Tokio 集成**: 原生支持 async/await 语法（可选）
 
 ## 系统要求
 
@@ -30,6 +32,10 @@ ctapi-rs 是一个安全、高性能的 Rust 库，用于与 Citect SCADA 系统
 ```toml
 [dependencies]
 ctapi-rs = "0.2.0"
+
+# 可选：启用 Tokio 集成
+ctapi-rs = { version = "0.2.0", features = ["tokio-support"] }
+tokio = { version = "1", features = ["full"] }
 ```
 
 ## 快速开始
@@ -98,6 +104,160 @@ fn search_tags() -> Result<()> {
 ```
 
 ### 标签列表操作
+
+```rust
+fn list_operations() -> Result<()> {
+    let client = CtClient::open(None, None, None, 0)?;
+    let mut list = client.list_new(0)?;
+    
+    // 添加多个标签到列表
+    list.add_tag("Temperature")?;
+    list.add_tag("Pressure")?;
+    
+    // 批量读取所有标签
+    list.read()?;
+    
+    // 获取各个标签的值
+    let temp = list.read_tag("Temperature", 0)?;
+    let press = list.read_tag("Pressure", 0)?;
+    
+    Ok(())
+}
+```
+
+### 多线程使用
+
+```rust
+use std::sync::Arc;
+use std::thread;
+
+fn multi_threaded_reads() -> Result<()> {
+    let client = Arc::new(CtClient::open(None, None, None, 0)?);
+    
+    let mut handles = vec![];
+    
+    for i in 0..4 {
+        let client = Arc::clone(&client);
+        let handle = thread::spawn(move || {
+            // 每个线程执行独立的读取操作
+            let tag_name = format!("Tag_{}", i);
+            client.tag_read(&tag_name)
+        });
+        handles.push(handle);
+    }
+    
+    // 等待所有线程完成
+    for handle in handles {
+        let result = handle.join().unwrap();
+        println!("Read result: {:?}", result);
+    }
+    
+    Ok(())
+}
+```
+
+**重要提示**: 
+- `CtClient` 可以在多线程间安全共享（通过 `Arc`）
+- `CtFind` 和 `CtList` 不能跨线程使用，每个线程应创建自己的实例
+- 确保所有派生对象（如 `CtFind`、`CtList`）在 `CtClient` 被 drop 前释放
+
+### 异步操作
+
+```rust
+use ctapi_rs::{CtClient, AsyncOperation, AsyncCtClient};
+
+fn async_operations() -> Result<()> {
+    let client = CtClient::open(None, None, None, 0)?;
+    
+    // 创建异步操作
+    let mut async_op = AsyncOperation::new();
+    
+    // 启动异步 Cicode 调用
+    client.cicode_async("Time(1)", 0, 0, &mut async_op)?;
+    
+    // 做其他工作
+    println!("等待结果...");
+    
+    // 获取结果（阻塞直到完成）
+    let result = async_op.get_result(&client)?;
+    println!("结果: {}", result);
+    
+    Ok(())
+}
+```
+
+**异步列表操作**:
+```rust
+fn async_list_operations() -> Result<()> {
+    let client = CtClient::open(None, None, None, 0)?;
+    let mut list = client.list_new(0)?;
+    
+    list.add_tag("Temperature")?;
+    list.add_tag("Pressure")?;
+    
+    // 异步读取
+    let mut async_op = AsyncOperation::new();
+    list.read_async(&mut async_op)?;
+    
+    // 轮询完成状态
+    while !async_op.is_complete() {
+        // 做其他工作
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    
+    // 读取值
+    let temp = list.read_tag("Temperature", 0)?;
+    let press = list.read_tag("Pressure", 0)?;
+    
+    Ok(())
+}
+```
+
+### Tokio async/await 集成
+
+启用 `tokio-support` feature 后，可以使用标准 async/await 语法：
+
+```rust
+use ctapi_rs::{CtClient, TokioCtClient};
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let client = CtClient::open(None, None, None, 0)?;
+    
+    // 使用 .await 语法
+    let time = client.cicode_tokio("Time(1)", 0, 0).await?;
+    println!("当前时间: {}", time);
+    
+    // 异步标签读写
+    let temp = client.tag_read_tokio("Temperature").await?;
+    client.tag_write_tokio("Setpoint", "25.5").await?;
+    
+    Ok(())
+}
+```
+
+**并发操作**:
+```rust
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let client = Arc::new(CtClient::open(None, None, None, 0)?);
+    
+    // 并发执行多个操作
+    let (time, date, version) = tokio::try_join!(
+        client.cicode_tokio("Time(1)", 0, 0),
+        client.cicode_tokio("Date(4)", 0, 0),
+        client.cicode_tokio("Version()", 0, 0)
+    )?;
+    
+    Ok(())
+}
+```
+
+更多详情参见 [TOKIO_INTEGRATION.md](TOKIO_INTEGRATION.md)
+
+## 架构设计
 
 ```rust
 fn use_tag_list() -> Result<()> {

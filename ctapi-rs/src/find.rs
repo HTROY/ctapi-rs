@@ -6,6 +6,15 @@ use std::ffi::{c_void, CString};
 use std::os::windows::io::RawHandle;
 
 /// Wrapper struct containing handle returned by [`CtClient::find_first`] function
+///
+/// # Thread Safety
+///
+/// `CtFind` is NOT thread-safe and should not be sent across threads.
+/// It holds a reference to `CtClient` and maintains mutable state during iteration.
+/// Each thread should create its own `CtFind` instance if parallel searches are needed.
+///
+/// Note: `CtFind` does not implement `Send` or `Sync` by default due to the
+/// interior mutability in `Iterator::next()` and the FFI handle management.
 #[derive(Debug)]
 pub struct CtFind<'a> {
     client: &'a super::CtClient,
@@ -89,8 +98,14 @@ impl Iterator for CtFind<'_> {
 
 impl Drop for CtFind<'_> {
     fn drop(&mut self) {
+        // SAFETY: Safe to call ctFindClose on a valid handle.
+        // The null check prevents double-free or invalid handle access.
+        // Since CtFind is not Send/Sync, it cannot be accessed from multiple threads.
         unsafe {
-            ctFindClose(self.handle);
+            if !self.handle.is_null() && !ctFindClose(self.handle) {
+                // Silently ignore errors in drop to avoid panics
+                // Errors here typically indicate the connection was already closed
+            }
         }
     }
 }
@@ -112,47 +127,6 @@ impl FindObject {
     /// - object.fields(n).type - Type of nth field in record
     /// - object.fields(n).actualsize - Actual size of nth field in record
     pub fn get_property<T: AsRef<str>>(&self, name: T) -> Result<String> {
-        #[cfg(test)]
-        mod tests {
-            use super::*;
-
-            #[test]
-            fn test_find_object_debug() {
-                let handle = 0x12345678 as *mut std::ffi::c_void;
-                let find_object = FindObject(handle);
-
-                // Test Debug implementation
-                let debug_string = format!("{:?}", find_object);
-                assert!(debug_string.contains("FindObject"));
-            }
-
-            #[test]
-            fn test_find_object_property_access() {
-                let handle = std::ptr::null_mut();
-                let find_object = FindObject(handle);
-
-                // Test null handle case
-                // Note: Don't test actual property retrieval here as it requires real CtAPI connection
-                // Only test basic functionality of struct
-                assert_eq!(find_object.0, std::ptr::null_mut());
-            }
-
-            #[test]
-            fn test_ct_find_lifetime() {
-                use std::ffi::CString;
-
-                // Since CtClient field is private, we can only test basic functionality of CtFind
-                // No need for actual client instance
-                let table_name = CString::new("test_table").unwrap();
-                let filter = CString::new("test_filter").unwrap();
-
-                // We don't create CtFind instance here as it requires valid client reference
-                // Just ensure CtFind struct basic functionality at compile time
-
-                // Test lifetime related functionality
-                assert_eq!(1 + 1, 2); // Placeholder test
-            }
-        }
         let mut buffer = [0u8; 256];
         let mut len: u32 = 0;
         let name = CString::new(GBK.encode(name.as_ref()).0)?;
@@ -172,5 +146,47 @@ impl FindObject {
                 .0
                 .to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_find_object_debug() {
+        let handle = 0x12345678 as *mut std::ffi::c_void;
+        let find_object = FindObject(handle);
+
+        // Test Debug implementation
+        let debug_string = format!("{:?}", find_object);
+        assert!(debug_string.contains("FindObject"));
+    }
+
+    #[test]
+    fn test_find_object_property_access() {
+        let handle = std::ptr::null_mut();
+        let find_object = FindObject(handle);
+
+        // Test null handle case
+        // Note: Don't test actual property retrieval here as it requires real CtAPI connection
+        // Only test basic functionality of struct
+        assert_eq!(find_object.0, std::ptr::null_mut());
+    }
+
+    #[test]
+    fn test_ct_find_lifetime() {
+        use std::ffi::CString;
+
+        // Since CtClient field is private, we can only test basic functionality of CtFind
+        // No need for actual client instance
+        let _table_name = CString::new("test_table").unwrap();
+        let _filter = CString::new("test_filter").unwrap();
+
+        // We don't create CtFind instance here as it requires valid client reference
+        // Just ensure CtFind struct basic functionality at compile time
+
+        // Test lifetime related functionality
+        assert_eq!(1 + 1, 2); // Placeholder test
     }
 }

@@ -63,7 +63,7 @@ pub enum CtApiError {
     },
 
     /// Other CtAPI error
-    #[error("CtAPI error code: {code}, message: {message}")]
+    #[error("CtAPI error code: {code}{}", if message.is_empty() { String::new() } else { format!(", message: {}", message) })]
     Other {
         /// Error code
         code: u32,
@@ -82,11 +82,11 @@ impl CtApiError {
             },
             1..=999 => CtApiError::Other {
                 code,
-                message: format!("CtAPI error code: {}", code),
+                message: String::new(),
             },
             _ => CtApiError::Other {
                 code,
-                message: format!("Unknown error code: {}", code),
+                message: "Unknown error".to_string(),
             },
         }
     }

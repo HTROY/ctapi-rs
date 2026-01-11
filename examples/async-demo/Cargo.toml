@@ -1,0 +1,7 @@
+[package]
+name = "async-demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ctapi-rs = { path = "../../ctapi-rs" }

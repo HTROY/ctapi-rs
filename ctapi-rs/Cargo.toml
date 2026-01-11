@@ -11,6 +11,12 @@ ctapi-sys = { path = "../ctapi-sys", version = "0.1.0" }
 encoding_rs = "0.8"
 libc = "0.2"
 thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync"], optional = true }
 
 [dev-dependencies]
 chrono = "~0.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[features]
+default = []
+tokio-support = ["tokio"]

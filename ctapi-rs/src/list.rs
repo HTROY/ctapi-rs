@@ -10,6 +10,16 @@ use std::os::windows::raw::HANDLE;
 const NULL: HANDLE = 0 as HANDLE;
 
 /// Wrapper struct containing ctapi list handle
+///
+/// # Thread Safety
+///
+/// `CtList` is NOT thread-safe and should not be shared across threads.
+/// It contains a `HashMap` for tag mapping and mutable state that requires
+/// exclusive access. The CtAPI documentation states that `ctListDelete()` can
+/// be called while operations are pending in another thread, but this refers
+/// to different list instances, not concurrent access to the same list.
+///
+/// For thread-safe list operations, create separate `CtList` instances per thread.
 #[derive(Debug)]
 pub struct CtList<'a> {
     client: &'a super::CtClient,
@@ -99,6 +109,48 @@ impl<'a> CtList<'a> {
         }
     }
 
+    /// Read tags in list asynchronously
+    ///
+    /// Non-blocking version of `read()`. The read operation will start and complete
+    /// in the background. Use `AsyncOperation::get_result()` or poll for completion.
+    ///
+    /// # Parameters
+    /// * `async_op` - AsyncOperation to track this read operation
+    ///
+    /// # Return Value
+    /// Returns `Ok(())` if the read operation was started successfully.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use ctapi_rs::{CtClient, AsyncOperation};
+    /// let client = CtClient::open(None, None, None, 0)?;
+    /// let mut list = client.list_new(0)?;
+    /// list.add_tag("Tag1")?;
+    ///
+    /// let mut async_op = AsyncOperation::new();
+    /// list.read_async(&mut async_op)?;
+    ///
+    /// // Wait for completion
+    /// while !async_op.is_complete() {
+    ///     std::thread::sleep(std::time::Duration::from_millis(10));
+    /// }
+    ///
+    /// let value = list.read_tag("Tag1", 0)?;
+    /// # Ok::<(), ctapi_rs::CtApiError>(())
+    /// ```
+    pub fn read_async(&self, async_op: &mut crate::AsyncOperation) -> Result<()> {
+        unsafe {
+            if !ctListRead(self.handle, async_op.overlapped_mut()) {
+                let error = std::io::Error::last_os_error();
+                // ERROR_IO_PENDING (997) is expected for async operations
+                if error.raw_os_error() != Some(997) {
+                    return Err(error.into());
+                }
+            }
+            Ok(())
+        }
+    }
+
     /// Get values of tags in list
     ///
     /// Call this function after ctListRead() completes for added tags.
@@ -149,18 +201,73 @@ impl<'a> CtList<'a> {
             Err(anyhow!("{}", tag.as_ref()))
         }
     }
+
+    /// Write single tag in list asynchronously
+    ///
+    /// Non-blocking version of `write_tag()`. The write operation will complete
+    /// in the background.
+    ///
+    /// # Parameters
+    /// * `tag` - Tag name to write
+    /// * `value` - Value to write
+    /// * `async_op` - AsyncOperation to track this write operation
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # use ctapi_rs::{CtClient, AsyncOperation};
+    /// let client = CtClient::open(None, None, None, 0)?;
+    /// let mut list = client.list_new(0)?;
+    /// list.add_tag("Tag1")?;
+    ///
+    /// let mut async_op = AsyncOperation::new();
+    /// list.write_tag_async("Tag1", "42", &mut async_op)?;
+    ///
+    /// // Wait for completion if needed
+    /// while !async_op.is_complete() {
+    ///     std::thread::sleep(std::time::Duration::from_millis(10));
+    /// }
+    /// # Ok::<(), ctapi_rs::CtApiError>(())
+    /// ```
+    pub fn write_tag_async<T: AsRef<str>>(
+        &self,
+        tag: T,
+        value: T,
+        async_op: &mut crate::AsyncOperation,
+    ) -> Result<()> {
+        if let Some(handle) = self.tag_map.get(tag.as_ref()) {
+            let value = CString::new(GBK.encode(value.as_ref()).0)?;
+            unsafe {
+                if !ctListWrite(*handle, value.as_ptr(), async_op.overlapped_mut()) {
+                    let error = std::io::Error::last_os_error();
+                    // ERROR_IO_PENDING (997) is expected for async operations
+                    if error.raw_os_error() != Some(997) {
+                        return Err(error.into());
+                    }
+                }
+            }
+            Ok(())
+        } else {
+            Err(anyhow!("Tag '{}' not found in list", tag.as_ref()))
+        }
+    }
 }
 
 impl Drop for CtList<'_> {
     fn drop(&mut self) {
+        // SAFETY: Safe to call ctListFree on a valid handle.
+        // Since CtList is not Send/Sync, it cannot be accessed from multiple threads.
+        // The handle is valid because it was created by ctListNew.
         unsafe {
-            ctListFree(self.handle);
+            if !self.handle.is_null() {
+                ctListFree(self.handle);
+                // Note: ctListFree doesn't return a success indicator,
+                // so we can't detect errors here
+            }
         }
     }
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::collections::HashMap;
     use std::os::windows::io::RawHandle;
 

@@ -5,7 +5,7 @@ const USER: &str = "Engineer";
 const PASSWORD: &str = "Citect";
 
 fn main() {
-    let mut client = CtClient::open(Some(COMPUTER), Some(USER), Some(PASSWORD), 0).unwrap();
+    let client = CtClient::open(Some(COMPUTER), Some(USER), Some(PASSWORD), 0).unwrap();
     let mut list = client.list_new(0).unwrap();
     list.add_tag("TagExt_DemoTag1").unwrap();
     list.add_tag("TagExt_DemoTag1_Mirror").unwrap();
