@@ -439,7 +439,7 @@ pub fn ct_client_create() -> Result<CtClient> {
 /// - `h_ctapi` has not been destroyed or freed previously
 /// - No other threads are concurrently using this handle
 pub unsafe fn ct_client_destroy(h_ctapi: HANDLE) -> Result<bool> {
-    if !ctClientDestroy(h_ctapi) {
+    if !unsafe { ctClientDestroy(h_ctapi) } {
         return Err(Error::last_os_error().into());
     }
     Ok(true)

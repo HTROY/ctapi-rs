@@ -10,7 +10,7 @@ use encoding_rs::*;
 use std::ffi::CString;
 use windows_sys::Win32::Foundation::{HANDLE, CloseHandle};
 
-extern "system" {
+unsafe extern "system" {
     fn CreateEventA(
         lp_event_attributes: *mut std::ffi::c_void,
         bManualReset: i32,
@@ -80,7 +80,7 @@ impl AsyncOperation {
         let mut buffer = vec![0u8; buffer_size];
 
         let mut overlapped = OVERLAPPED::new();
-        overlapped.hEvent = event_handle as *mut std::ffi::c_void;
+        overlapped.hEvent = event_handle;
         overlapped.dwStatus = 0;
         overlapped.dwLength = 0;
         overlapped.pData = buffer.as_mut_ptr();
@@ -279,7 +279,7 @@ impl AsyncOperation {
         // Reset OVERLAPPED but preserve the event handle
         let event_handle = self.event_handle;
         self.overlapped = OVERLAPPED::new();
-        self.overlapped.hEvent = event_handle as *mut std::ffi::c_void;
+        self.overlapped.hEvent = event_handle;
         self.overlapped.pData = self.buffer.as_mut_ptr();
         self.buffer.fill(0);
     }

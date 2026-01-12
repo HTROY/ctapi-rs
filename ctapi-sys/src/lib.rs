@@ -197,7 +197,7 @@ pub enum DBTYPEENUM {
 #[cfg(target_os = "windows")]
 #[link(name = "CtApi", kind = "raw-dylib")]
 #[allow(non_snake_case)]
-extern "system" {
+unsafe extern "system" {
     ///FFI API function
     pub fn ctCancelIO(hCTAPI: HANDLE, pctOverlapped: *mut OVERLAPPED) -> bool;
     pub fn ctCicode(
