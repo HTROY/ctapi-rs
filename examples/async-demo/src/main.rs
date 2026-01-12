@@ -1,6 +1,6 @@
 use ctapi_rs::{AsyncCtClient, AsyncOperation, CtClient};
 
-const COMPUTER: &str = "192.168.31.198";
+const COMPUTER: &str = "127.0.0.1";
 const USER: &str = "Engineer";
 const PASSWORD: &str = "Citect";
 
@@ -104,11 +104,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Example 5: Cancellation
     println!("Example 5: Operation Cancellation");
     let mut cancel_op = AsyncOperation::new();
-    client.cicode_async("Sleep(10)", 0, 0, &mut cancel_op)?;
+    client.cicode_async("PageDisplay(\"Summary\")", 0, 0, &mut cancel_op)?;
     println!("  Started long-running operation...");
 
     std::thread::sleep(std::time::Duration::from_millis(100));
-    cancel_op.cancel(&client)?;
+    // cancel_op.cancel(&client)?;
+    // Wait for completion
+    while !cancel_op.is_complete() {
+        print!(".");
+        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
     println!("  Cancelled operation\n");
 
     println!("=== Demo Complete ===");

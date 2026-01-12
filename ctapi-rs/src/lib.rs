@@ -47,17 +47,23 @@ mod tests {
     use std::sync::Arc;
     use std::{thread::sleep, time::Duration};
 
-    const COMPUTER: &str = "192.168.1.12";
-    const USER: &str = "Manager";
-    const PASSWORD: &str = "Citect";
+    /// Helper function to get connection parameters from environment variables
+    /// Returns None for each parameter if the corresponding environment variable is not set
+    fn get_connection_params() -> (Option<String>, Option<String>, Option<String>) {
+        let computer = std::env::var("CITECT_COMPUTER").ok();
+        let user = std::env::var("CITECT_USER").ok();
+        let password = std::env::var("CITECT_PASSWORD").ok();
+        (computer, user, password)
+    }
 
     fn is_send<T: Send>(_t: T) {}
 
     #[test]
     #[ignore = "Requires actual Citect SCADA connection"]
     fn client_tag_read_ex_test() {
+        let (computer, user, password) = get_connection_params();
         let mut value = CtTagValueItems::default();
-        let client = CtClient::open(Some(COMPUTER), Some(USER), Some(PASSWORD), 0).unwrap();
+        let client = CtClient::open(computer.as_deref(), user.as_deref(), password.as_deref(), 0).unwrap();
         // is_send(client);
         let result = client.tag_read_ex("BIT_1", &mut value);
         println!("{result:?} {value:?}");
@@ -66,7 +72,8 @@ mod tests {
     #[test]
     #[ignore = "Requires actual Citect SCADA connection"]
     fn client_find_first_test() {
-        let client = CtClient::open(Some(COMPUTER), Some(USER), Some(PASSWORD), 0).unwrap();
+        let (computer, user, password) = get_connection_params();
+        let client = CtClient::open(computer.as_deref(), user.as_deref(), password.as_deref(), 0).unwrap();
         let result = client.find_first("Tag", "CLUSTER=Cluster1", None);
         for object in result {
             println!(
@@ -80,7 +87,8 @@ mod tests {
     #[test]
     #[ignore = "Requires actual Citect SCADA connection"]
     fn list_test() {
-        let client = CtClient::open(Some(COMPUTER), Some(USER), Some(PASSWORD), 0).unwrap();
+        let (computer, user, password) = get_connection_params();
+        let client = CtClient::open(computer.as_deref(), user.as_deref(), password.as_deref(), 0).unwrap();
         let mut list = client.list_new(0).unwrap();
         list.add_tag("BIT_1").unwrap();
         list.read().unwrap();
@@ -92,7 +100,8 @@ mod tests {
     #[test]
     #[ignore = "Requires actual Citect SCADA connection"]
     fn multi_client_test() {
-        let client1 = CtClient::open(Some(COMPUTER), Some(USER), Some(PASSWORD), 0).unwrap();
+        let (computer, user, password) = get_connection_params();
+        let client1 = CtClient::open(computer.as_deref(), user.as_deref(), password.as_deref(), 0).unwrap();
         let result = client1.find_first("Tag", "CLUSTER=Cluster1", None);
         let _res: Vec<()> = result
             .map(|object| {
@@ -109,7 +118,8 @@ mod tests {
     #[ignore = "Requires actual Citect SCADA connection"]
     fn multi_thread_test() {
         // This test verifies that CtClient can be safely shared across threads using Arc
-        let client = CtClient::open(Some(COMPUTER), Some(USER), Some(PASSWORD), 0).unwrap();
+        let (computer, user, password) = get_connection_params();
+        let client = CtClient::open(computer.as_deref(), user.as_deref(), password.as_deref(), 0).unwrap();
         let client = std::sync::Arc::new(client);
         
         let client1 = Arc::clone(&client);
@@ -162,7 +172,8 @@ mod tests {
     #[test]
     #[ignore = "Requires actual Citect SCADA connection"]
     fn client_find_alarm_test() {
-        let client = CtClient::open(Some(COMPUTER), Some(USER), Some(PASSWORD), 0).unwrap();
+        let (computer, user, password) = get_connection_params();
+        let client = CtClient::open(computer.as_deref(), user.as_deref(), password.as_deref(), 0).unwrap();
         let tag_name = "Feed_SPC_11";
         let time = chrono::Utc::now();
         let start_time = time
@@ -198,7 +209,8 @@ mod tests {
     #[test]
     #[ignore = "Requires actual Citect SCADA connection"]
     fn client_drop_test() {
-        let client = CtClient::open(Some(COMPUTER), Some(USER), Some(PASSWORD), 0).unwrap();
+        let (computer, user, password) = get_connection_params();
+        let client = CtClient::open(computer.as_deref(), user.as_deref(), password.as_deref(), 0).unwrap();
         println!("{:?}", client.tag_read("BIT_1"));
         sleep(Duration::from_secs(15));
         drop(client);

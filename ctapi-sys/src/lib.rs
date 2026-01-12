@@ -1,10 +1,36 @@
 #![allow(dead_code)]
 use std::os::windows::raw::HANDLE;
 use std::{ffi::c_void, os::raw::c_char};
-pub use windows_sys::Win32::System::IO::OVERLAPPED;
 pub type LPCSTR = *const c_char;
 pub type LPSTR = *mut c_char;
 pub type DWORD = u32;
+pub type BYTE = u8;
+
+/// CtAPI OVERLAPPED structure for asynchronous operations
+/// This is different from Windows' standard OVERLAPPED structure
+#[allow(non_snake_case)]
+#[derive(Clone, Copy, Debug)]
+#[repr(C, packed)]
+pub struct OVERLAPPED {
+    pub dwStatus: DWORD,         // Completion status
+    pub dwLength: DWORD,         // Length of result buffer
+    pub pData: *mut BYTE,        // Result buffer
+    pub OffsetHigh: DWORD,       // Not used (as per Win32)
+    pub hEvent: *mut c_void,     // Event handle to signal
+}
+
+impl OVERLAPPED {
+    /// Create a new zeroed OVERLAPPED structure
+    pub fn new() -> Self {
+        unsafe { std::mem::zeroed() }
+    }
+}
+
+impl Default for OVERLAPPED {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C, packed)]

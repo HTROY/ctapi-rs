@@ -13,7 +13,7 @@ async fn main() -> anyhow::Result<()> {
     println!("=== Tokio CtAPI Demo ===\n");
 
     // Connect to Citect SCADA
-    let client = match CtClient::open(None, None, None, 0) {
+    let client = match CtClient::open(Some("127.0.0.1"), Some("Engineer"), Some("Citect"), 0) {
         Ok(c) => {
             println!("✓ Connected to Citect SCADA\n");
             Arc::new(c)
@@ -130,7 +130,7 @@ async fn demo_concurrent_operations(client: &Arc<CtClient>) -> anyhow::Result<()
 /// Demo 3: Async tag operations
 async fn demo_tag_operations(client: &Arc<CtClient>) -> anyhow::Result<()> {
     // Read tags asynchronously
-    let tags = vec!["Temperature", "Pressure", "FlowRate"];
+    let tags = vec!["BIT_1", "BIT_2", "BIT_3"];
 
     for tag in &tags {
         match client.tag_read_tokio(tag).await {
@@ -140,7 +140,7 @@ async fn demo_tag_operations(client: &Arc<CtClient>) -> anyhow::Result<()> {
     }
 
     // Write a tag asynchronously
-    match client.tag_write_tokio("Setpoint", "25.5").await {
+    match client.tag_write_tokio("Plot_", "25.5").await {
         Ok(_) => println!("✓ Wrote Setpoint = 25.5"),
         Err(e) => eprintln!("✗ Failed to write: {}", e),
     }
@@ -153,7 +153,7 @@ async fn demo_list_operations(client: &Arc<CtClient>) -> anyhow::Result<()> {
     let mut list = client.list_new(0)?;
 
     // Add tags to list
-    let tags = vec!["Temperature", "Pressure", "FlowRate"];
+    let tags = vec!["BIT_1", "BIT_2", "BIT_3"];
     for tag in &tags {
         list.add_tag(tag)?;
     }

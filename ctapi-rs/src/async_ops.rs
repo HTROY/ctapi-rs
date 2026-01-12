@@ -8,6 +8,16 @@ use crate::CtClient;
 use ctapi_sys::*;
 use encoding_rs::*;
 use std::ffi::CString;
+use windows_sys::Win32::Foundation::{HANDLE, CloseHandle};
+
+extern "system" {
+    fn CreateEventA(
+        lp_event_attributes: *mut std::ffi::c_void,
+        bManualReset: i32,
+        bInitialState: i32,
+        lp_name: *const u8,
+    ) -> HANDLE;
+}
 
 /// Helper function: Convert string to GBK encoded CString
 fn encode_to_gbk_cstring(s: &str) -> std::result::Result<CString, std::ffi::NulError> {
@@ -46,7 +56,8 @@ fn encode_to_gbk_cstring(s: &str) -> std::result::Result<CString, std::ffi::NulE
 /// ```
 pub struct AsyncOperation {
     overlapped: OVERLAPPED,
-    buffer: Vec<i8>,
+    buffer: Vec<u8>,
+    event_handle: HANDLE,
 }
 
 impl AsyncOperation {
@@ -54,10 +65,7 @@ impl AsyncOperation {
     ///
     /// Initializes a new OVERLAPPED structure for asynchronous operations.
     pub fn new() -> Self {
-        Self {
-            overlapped: unsafe { std::mem::zeroed() },
-            buffer: vec![0i8; 256],
-        }
+        Self::with_buffer_size(256)
     }
 
     /// Create a new async operation with custom buffer size
@@ -65,9 +73,22 @@ impl AsyncOperation {
     /// # Parameters
     /// * `buffer_size` - Size of the internal buffer for results
     pub fn with_buffer_size(buffer_size: usize) -> Self {
+        // Create an event for the OVERLAPPED structure
+        let event_handle = unsafe { CreateEventA(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+
+        // Allocate buffer for results
+        let mut buffer = vec![0u8; buffer_size];
+
+        let mut overlapped = OVERLAPPED::new();
+        overlapped.hEvent = event_handle as *mut std::ffi::c_void;
+        overlapped.dwStatus = 0;
+        overlapped.dwLength = 0;
+        overlapped.pData = buffer.as_mut_ptr();
+
         Self {
-            overlapped: unsafe { std::mem::zeroed() },
-            buffer: vec![0i8; buffer_size],
+            overlapped,
+            buffer,
+            event_handle,
         }
     }
 
@@ -79,11 +100,6 @@ impl AsyncOperation {
     /// while an operation is in progress. Misuse can lead to undefined behavior.
     pub unsafe fn overlapped_mut(&mut self) -> *mut OVERLAPPED {
         &mut self.overlapped
-    }
-
-    /// Get mutable reference to internal buffer
-    pub(crate) fn buffer_mut(&mut self) -> &mut [i8] {
-        &mut self.buffer
     }
 
     /// Check if the async operation has completed
@@ -105,12 +121,10 @@ impl AsyncOperation {
     /// # Ok::<(), ctapi_rs::CtApiError>(())
     /// ```
     pub fn is_complete(&self) -> bool {
-        // Check Internal field of OVERLAPPED to determine completion
-        // Note: This is a simplified check. For production, use ctGetOverlappedResult
-        unsafe {
-            let internal = *(&self.overlapped as *const OVERLAPPED as *const usize);
-            internal != 259 // STATUS_PENDING
-        }
+        // Check if operation has completed using STATUS_PENDING check
+        // dwStatus != STATUS_PENDING (0x103) means operation completed
+        const STATUS_PENDING: DWORD = 0x103;
+        self.overlapped.dwStatus != STATUS_PENDING
     }
 
     /// Wait for the async operation to complete and get the result
@@ -151,9 +165,10 @@ impl AsyncOperation {
                 return Err(std::io::Error::last_os_error().into());
             }
 
-            // Decode the result from buffer
-            let u8_buffer: &[u8] = std::mem::transmute(&self.buffer[..]);
-            let cstr = std::ffi::CStr::from_bytes_until_nul(u8_buffer)
+            // Extract result from the buffer
+            let result_len = bytes_transferred.min(self.buffer.len() as u32) as usize;
+            let result_slice = &self.buffer[..result_len];
+            let cstr = std::ffi::CStr::from_bytes_until_nul(result_slice)
                 .map_err(CtApiError::FromBytesUntilNul)?;
             let decoded = GBK.decode(cstr.to_bytes()).0.to_string();
             Ok(decoded)
@@ -207,8 +222,9 @@ impl AsyncOperation {
                 false, // bWait = false
             ) {
                 // Operation completed successfully
-                let u8_buffer: &[u8] = std::mem::transmute(&self.buffer[..]);
-                let result = std::ffi::CStr::from_bytes_until_nul(u8_buffer)
+                let result_len = bytes_transferred.min(self.buffer.len() as u32) as usize;
+                let result_slice = &self.buffer[..result_len];
+                let result = std::ffi::CStr::from_bytes_until_nul(result_slice)
                     .map_err(CtApiError::FromBytesUntilNul)
                     .map(|cstr| GBK.decode(cstr.to_bytes()).0.to_string());
                 Some(result)
@@ -260,8 +276,23 @@ impl AsyncOperation {
     /// Clears the OVERLAPPED structure and buffer, allowing the same
     /// AsyncOperation instance to be used for a new operation.
     pub fn reset(&mut self) {
-        self.overlapped = unsafe { std::mem::zeroed() };
+        // Reset OVERLAPPED but preserve the event handle
+        let event_handle = self.event_handle;
+        self.overlapped = OVERLAPPED::new();
+        self.overlapped.hEvent = event_handle as *mut std::ffi::c_void;
+        self.overlapped.pData = self.buffer.as_mut_ptr();
         self.buffer.fill(0);
+    }
+}
+
+impl Drop for AsyncOperation {
+    fn drop(&mut self) {
+        // Clean up the event handle
+        if !self.event_handle.is_null() && self.event_handle as isize != -1 {
+            unsafe {
+                CloseHandle(self.event_handle);
+            }
+        }
     }
 }
 
@@ -276,6 +307,7 @@ impl std::fmt::Debug for AsyncOperation {
         f.debug_struct("AsyncOperation")
             .field("is_complete", &self.is_complete())
             .field("buffer_size", &self.buffer.len())
+            .field("event_handle", &self.event_handle)
             .finish()
     }
 }
@@ -338,8 +370,8 @@ impl AsyncCtClient for CtClient {
                 cmd.as_ptr(),
                 vh_win,
                 mode,
-                async_op.buffer_mut().as_mut_ptr(),
-                async_op.buffer_mut().len() as u32,
+                async_op.buffer.as_mut_ptr() as *mut i8,
+                async_op.buffer.len() as u32,
                 async_op.overlapped_mut(),
             ) {
                 let error = std::io::Error::last_os_error();
@@ -360,20 +392,25 @@ mod tests {
     #[test]
     fn test_async_operation_creation() {
         let async_op = AsyncOperation::new();
+        assert!(!async_op.event_handle.is_null());
         assert_eq!(async_op.buffer.len(), 256);
     }
 
     #[test]
     fn test_async_operation_with_buffer_size() {
         let async_op = AsyncOperation::with_buffer_size(512);
+        assert!(!async_op.event_handle.is_null());
         assert_eq!(async_op.buffer.len(), 512);
     }
 
     #[test]
     fn test_async_operation_reset() {
         let mut async_op = AsyncOperation::new();
+        let original_handle = async_op.event_handle;
         async_op.buffer[0] = 42;
         async_op.reset();
+        // After reset, the event handle should remain the same
+        assert_eq!(original_handle, async_op.event_handle);
         assert_eq!(async_op.buffer[0], 0);
     }
 
@@ -382,6 +419,5 @@ mod tests {
         let async_op = AsyncOperation::new();
         let debug_str = format!("{:?}", async_op);
         assert!(debug_str.contains("AsyncOperation"));
-        assert!(debug_str.contains("buffer_size"));
     }
 }

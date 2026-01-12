@@ -1,6 +1,6 @@
 use ctapi_rs::CtClient;
 
-const COMPUTER: &str = "192.168.1.12";
+const COMPUTER: &str = "127.0.0.1";
 const USER: &str = "Manager";
 const PASSWORD: &str = "Citect";
 
