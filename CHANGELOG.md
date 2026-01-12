@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add tokio async runtime integration and OVERLAPPED I/O support by @HTROY
 
 ### Changed
+- Migrate test credentials to environment variables by @HTROY
 - Update CHANGELOG.md by @HTROY
 - Update windwos-sys deps, add list-read example by @HTROY
 - (chore): refatcor ctapi-rs by @HTROY

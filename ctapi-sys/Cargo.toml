@@ -1,6 +1,6 @@
 [package]
 name = "ctapi-sys"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Cheng Huang <htroyvip@gmail.com>"]
 build = "build.rs"
 keywords = ["Citect", "CtApi"]
@@ -9,7 +9,7 @@ description = """
 FFI bindings to the Citect CtApi C library"
 """
 
-edition = "2021"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
