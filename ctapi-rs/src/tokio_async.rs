@@ -142,7 +142,7 @@ impl TokioCtClient for CtClient {
     async fn cicode_tokio(&self, cmd: &str, vh_win: u32, mode: u32) -> Result<String> {
         let client = Arc::new(self.clone());
         let cmd = cmd.to_string();
-        
+
         tokio::task::spawn_blocking(move || {
             let mut async_op = AsyncOperation::new();
             client.cicode_async(&cmd, vh_win, mode, &mut async_op)?;
@@ -158,7 +158,7 @@ impl TokioCtClient for CtClient {
     async fn tag_read_tokio(&self, tag: &str) -> Result<String> {
         let client = self.clone();
         let tag = tag.to_string();
-        
+
         tokio::task::spawn_blocking(move || client.tag_read(&tag))
             .await
             .map_err(|e| crate::error::CtApiError::Other {
@@ -171,7 +171,7 @@ impl TokioCtClient for CtClient {
         let client = self.clone();
         let tag = tag.to_string();
         let value_copy = value.to_string();
-        
+
         tokio::task::spawn_blocking(move || {
             // Try parsing as numeric types (Copy types that work with tag_write)
             if let Ok(num) = value_copy.parse::<f64>() {
@@ -199,7 +199,7 @@ impl TokioCtClient for Arc<CtClient> {
     async fn cicode_tokio(&self, cmd: &str, vh_win: u32, mode: u32) -> Result<String> {
         let client = Arc::clone(self);
         let cmd = cmd.to_string();
-        
+
         tokio::task::spawn_blocking(move || {
             let mut async_op = AsyncOperation::new();
             client.cicode_async(&cmd, vh_win, mode, &mut async_op)?;
@@ -215,7 +215,7 @@ impl TokioCtClient for Arc<CtClient> {
     async fn tag_read_tokio(&self, tag: &str) -> Result<String> {
         let client = Arc::clone(self);
         let tag = tag.to_string();
-        
+
         tokio::task::spawn_blocking(move || client.tag_read(&tag))
             .await
             .map_err(|e| crate::error::CtApiError::Other {
@@ -228,7 +228,7 @@ impl TokioCtClient for Arc<CtClient> {
         let client = Arc::clone(self);
         let tag = tag.to_string();
         let value_copy = value.to_string();
-        
+
         tokio::task::spawn_blocking(move || {
             // Try parsing as numeric types (Copy types that work with tag_write)
             if let Ok(num) = value_copy.parse::<f64>() {
@@ -269,9 +269,9 @@ pub trait TokioCtList {
     /// let mut list = client.list_new(0)?;
     /// list.add_tag("Temperature")?;
     /// list.add_tag("Pressure")?;
-    /// 
+    ///
     /// list.read_tokio().await?;
-    /// 
+    ///
     /// let temp = list.read_tag("Temperature", 0)?;
     /// let press = list.read_tag("Pressure", 0)?;
     /// # Ok(())
@@ -283,16 +283,17 @@ pub trait TokioCtList {
 impl<'a> TokioCtList for CtList<'a> {
     async fn read_tokio(&mut self) -> Result<()> {
         let mut async_op = AsyncOperation::new();
-        self.read_async(&mut async_op).map_err(|e| crate::error::CtApiError::Other {
-            code: 0,
-            message: e.to_string(),
-        })?;
-        
+        self.read_async(&mut async_op)
+            .map_err(|e| crate::error::CtApiError::Other {
+                code: 0,
+                message: e.to_string(),
+            })?;
+
         // Poll until complete
         while !async_op.is_complete() {
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
-        
+
         Ok(())
     }
 }

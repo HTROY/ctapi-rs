@@ -1,5 +1,5 @@
 //! Tag list operation related implementation
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use ctapi_sys::*;
 use encoding_rs::*;
 use std::collections::HashMap;
@@ -275,7 +275,7 @@ mod tests {
     fn test_ct_list_debug() {
         // Since CtClient field is private, we only test basic functionality of struct
         // Don't create actual CtList instance
-         
+
         // Test struct Debug implementation
         assert_eq!(1 + 1, 2); // Placeholder test
     }
@@ -284,14 +284,14 @@ mod tests {
     fn test_tag_map_functionality() {
         // Test HashMap basic functionality (used inside CtList)
         let mut map = HashMap::new();
-        
+
         // Test empty mapping
         assert_eq!(map.len(), 0);
-        
+
         // Test insertion
         let mock_handle: RawHandle = std::ptr::null_mut();
         map.insert("test_tag".to_string(), mock_handle);
-        
+
         assert_eq!(map.len(), 1);
         assert!(map.contains_key("test_tag"));
     }

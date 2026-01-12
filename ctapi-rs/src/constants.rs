@@ -13,7 +13,7 @@ pub const CT_SCALE_NOISE_FACTOR: u32 = 0x00000004;
 /// don't scale the variable
 pub const CT_FMT_NO_SCALE: u32 = 0x00000001;
 /// don't apply format
-pub const CT_FMT_NO_FORMAT: u32 = 0x00000002; 
+pub const CT_FMT_NO_FORMAT: u32 = 0x00000002;
 /// get last value of data
 pub const CT_FMT_LAST: u32 = 0x00000004;
 /// range check the variable

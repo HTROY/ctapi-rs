@@ -408,7 +408,7 @@ impl Drop for CtClient {
         // 2. The handle is valid (or null, which ctClose handles safely)
         // 3. When using Arc<CtClient>, Rust ensures this is called only once
         //    after all references are gone
-        // 
+        //
         // Note: If derived objects (CtFind, CtList) outlive the client in unsafe code,
         // this could cause use-after-free. Users should ensure proper lifetimes.
         unsafe {
@@ -506,7 +506,7 @@ mod tests {
         // Test cloning
         let client1_clone = client1.clone();
         assert_eq!(client1, client1_clone);
-        
+
         // Prevent drop from being called on fake handles
         std::mem::forget(client1);
         std::mem::forget(client2);

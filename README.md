@@ -20,7 +20,7 @@ ctapi-rs 是一个安全、高性能的 Rust 库，用于与 Citect SCADA 系统
 
 ## 系统要求
 
-- Rust 1.70 或更高版本
+- Rust 1.85 或更高版本
 - Windows 操作系统
 - Citect SCADA 系统（需要 CtAPI.dll）
 - Visual C++ Redistributable
@@ -31,10 +31,10 @@ ctapi-rs 是一个安全、高性能的 Rust 库，用于与 Citect SCADA 系统
 
 ```toml
 [dependencies]
-ctapi-rs = "0.2.0"
+ctapi-rs = "0.3.0"
 
 # 可选：启用 Tokio 集成
-ctapi-rs = { version = "0.2.0", features = ["tokio-support"] }
+ctapi-rs = { version = "0.3.0", features = ["tokio-support"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -372,7 +372,7 @@ match client.tag_read("nonexistent_tag") {
 
 ### 开发环境设置
 
-1. 安装 Rust 1.70+
+1. 安装 Rust 1.85+
 2. 安装 Visual Studio Build Tools
 3. 克隆仓库并运行 `cargo build`
 

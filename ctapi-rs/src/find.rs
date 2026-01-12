@@ -2,7 +2,7 @@
 use anyhow::Result;
 use ctapi_sys::*;
 use encoding_rs::*;
-use std::ffi::{c_void, CString};
+use std::ffi::{CString, c_void};
 use std::os::windows::io::RawHandle;
 
 /// Wrapper struct containing handle returned by [`CtClient::find_first`] function

@@ -146,9 +146,6 @@ mod tests {
     #[test]
     fn test_error_code() {
         let error = CtApiError::from_error_code(123);
-        assert_eq!(
-            error.to_string(),
-            "CtAPI error code: 123"
-        );
+        assert_eq!(error.to_string(), "CtAPI error code: 123");
     }
 }

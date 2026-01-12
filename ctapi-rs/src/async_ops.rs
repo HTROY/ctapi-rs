@@ -3,12 +3,12 @@
 //! This module provides asynchronous versions of CtAPI operations that support
 //! non-blocking I/O through Windows OVERLAPPED structures.
 
-use crate::error::{CtApiError, Result};
 use crate::CtClient;
+use crate::error::{CtApiError, Result};
 use ctapi_sys::*;
 use encoding_rs::*;
 use std::ffi::CString;
-use windows_sys::Win32::Foundation::{HANDLE, CloseHandle};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
 
 unsafe extern "system" {
     fn CreateEventA(

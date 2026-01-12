@@ -21,21 +21,22 @@ fn main() {
         lib_dir = lib_dir.join("x64");
     }
 
-    
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rustc-link-search=native={}", &lib_dir.display());
-    
+
     for entry in Path::new(&lib_dir)
         .read_dir()
         .expect("read dir call failed")
     {
         let entry = entry.unwrap();
         let path = entry.path();
-        if path.is_file() && !Path::new(&out_dir)
+        if path.is_file()
+            && !Path::new(&out_dir)
                 .join("deps")
                 .join(path.file_name().unwrap())
                 .as_path()
-                .exists() {
+                .exists()
+        {
             fs::copy(
                 &path,
                 Path::new(&out_dir)

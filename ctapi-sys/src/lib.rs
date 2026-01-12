@@ -12,11 +12,11 @@ pub type BYTE = u8;
 #[derive(Clone, Copy, Debug)]
 #[repr(C, packed)]
 pub struct OVERLAPPED {
-    pub dwStatus: DWORD,         // Completion status
-    pub dwLength: DWORD,         // Length of result buffer
-    pub pData: *mut BYTE,        // Result buffer
-    pub OffsetHigh: DWORD,       // Not used (as per Win32)
-    pub hEvent: *mut c_void,     // Event handle to signal
+    pub dwStatus: DWORD,     // Completion status
+    pub dwLength: DWORD,     // Length of result buffer
+    pub pData: *mut BYTE,    // Result buffer
+    pub OffsetHigh: DWORD,   // Not used (as per Win32)
+    pub hEvent: *mut c_void, // Event handle to signal
 }
 
 impl OVERLAPPED {
