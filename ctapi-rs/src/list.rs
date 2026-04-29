@@ -136,7 +136,7 @@ impl<'a> CtList<'a> {
     /// }
     ///
     /// let value = list.read_tag("Tag1", 0)?;
-    /// # Ok::<(), ctapi_rs::CtApiError>(())
+    /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn read_async(&self, async_op: &mut crate::AsyncOperation) -> Result<()> {
         unsafe {
@@ -226,7 +226,7 @@ impl<'a> CtList<'a> {
     /// while !async_op.is_complete() {
     ///     std::thread::sleep(std::time::Duration::from_millis(10));
     /// }
-    /// # Ok::<(), ctapi_rs::CtApiError>(())
+    /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn write_tag_async<T: AsRef<str>>(
         &self,

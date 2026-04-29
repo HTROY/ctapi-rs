@@ -22,9 +22,10 @@ pub mod scaling;
 #[cfg(feature = "tokio-support")]
 pub mod tokio_async;
 
-pub use crate::async_ops::{AsyncCtClient, AsyncOperation};
+pub use crate::async_ops::{AsyncCtClient, AsyncOperation, CtApiFuture, FutureCtClient};
 pub use crate::client::*;
 pub use crate::constants::*;
+pub use crate::error::CtApiError;
 pub use crate::find::*;
 pub use crate::list::*;
 pub use crate::scaling::*;

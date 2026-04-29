@@ -229,8 +229,11 @@ impl CtClient {
     ///
     /// let value = client.tag_read_ex("Pressure", &mut value_items)?;
     /// println!("Pressure value: {}", value);
-    /// println!("Timestamp: {}", value_items.timestamp);
-    /// println!("Quality: {}", value_items.quality_general);
+    /// // Copy fields from packed struct before use to avoid misaligned reference
+    /// let ts = { value_items.timestamp };
+    /// let quality = { value_items.quality_general };
+    /// println!("Timestamp: {}", ts);
+    /// println!("Quality: {}", quality);
     /// # Ok::<(), ctapi_rs::CtApiError>(())
     /// ```
     pub fn tag_read_ex<T: AsRef<str>>(
@@ -281,14 +284,15 @@ impl CtClient {
     ///
     /// let client = CtClient::open(None, None, None, 0)?;
     ///
-    /// // Write numeric value
-    /// client.tag_write("Temperature", 25.5)?;
+    /// // Write a float value
+    /// client.tag_write("Temperature", 25.5_f64)?;
     ///
-    /// // Write boolean value
-    /// client.tag_write("Pump_Start", true)?;
+    /// // Write an integer value
+    /// client.tag_write("Counter", 42_i32)?;
     ///
-    /// // Write string value
-    /// client.tag_write("Status", "Running")?;
+    /// // For string/bool values, use tag_write_str instead:
+    /// client.tag_write_str("Status", "Running")?;
+    /// client.tag_write_str("Pump_Start", "1")?;
     /// # Ok::<(), ctapi_rs::CtApiError>(())
     /// ```
     pub fn tag_write<T, U>(&self, tag: T, value: U) -> Result<bool>
@@ -301,6 +305,50 @@ impl CtClient {
             tag: tag.as_ref().to_string(),
         })?;
         let s_value = CString::new(value.to_string())?;
+
+        unsafe {
+            if !ctTagWrite(self.handle, tag.as_ptr(), s_value.as_ptr()) {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(true)
+        }
+    }
+
+    /// Write tag value as a plain string
+    ///
+    /// Unlike [`tag_write`], this method accepts any string value without
+    /// requiring the value type to implement `Add + Sub + Copy`.  It is
+    /// particularly useful for writing enum-like string tags or when the
+    /// value is already a `String` / `&str`.
+    ///
+    /// # Parameters
+    /// * `tag`   - Tag name
+    /// * `value` - Value string to write (GBK-encoded internally)
+    ///
+    /// # Return Value
+    /// Returns `true` if the write succeeded.
+    ///
+    /// # Errors
+    /// * [`CtApiError::TagNotFound`] - Tag does not exist or is not writable
+    /// * [`CtApiError::System`]      - System call failed
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use ctapi_rs::CtClient;
+    ///
+    /// let client = CtClient::open(None, None, None, 0)?;
+    /// client.tag_write_str("Status", "Running")?;
+    /// client.tag_write_str("Setpoint", "25.5")?;
+    /// # Ok::<(), ctapi_rs::CtApiError>(())
+    /// ```
+    pub fn tag_write_str<T: AsRef<str>>(&self, tag: T, value: &str) -> Result<bool> {
+        let tag = encode_to_gbk_cstring(tag.as_ref()).map_err(|_| CtApiError::TagNotFound {
+            tag: tag.as_ref().to_string(),
+        })?;
+        let s_value = encode_to_gbk_cstring(value).map_err(|_| CtApiError::InvalidParameter {
+            param: "value".to_string(),
+            value: value.to_string(),
+        })?;
 
         unsafe {
             if !ctTagWrite(self.handle, tag.as_ptr(), s_value.as_ptr()) {
