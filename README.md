@@ -158,7 +158,8 @@ fn multi_threaded_reads() -> Result<()> {
 
 **重要提示**: 
 - `CtClient` 可以在多线程间安全共享（通过 `Arc`）
-- `CtFind` 和 `CtList` 不能跨线程使用，每个线程应创建自己的实例
+- `CtFind` 不能跨线程使用，每个线程应创建自己的 `CtFind` 实例
+- `CtList` 现在支持跨线程共享，使用 `Arc<CtList>` 可以在多线程间安全使用
 - 确保所有派生对象（如 `CtFind`、`CtList`）在 `CtClient` 被 drop 前释放
 
 ### 异步操作

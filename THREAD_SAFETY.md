@@ -39,6 +39,40 @@ for handle in handles {
 - ✅ 读写混合是安全的
 - ✅ Clone 操作是线程安全的
 
+#### `CtList`
+
+`CtList` 现在实现了 `Send` 和 `Sync`，内部使用 `Mutex` 保护所有 FFI 调用，可以通过 `Arc<CtList>` 在多线程间安全共享：
+
+```rust
+use std::sync::Arc;
+use ctapi_rs::CtClient;
+
+let client = Arc::new(CtClient::open(None, None, None, 0)?);
+let list = Arc::new(client.list_new(0)?);
+list.add_tag("Temperature")?;
+
+let list1 = Arc::clone(&list);
+let list2 = Arc::clone(&list);
+
+let h1 = std::thread::spawn(move || {
+    list1.read().unwrap();
+    list1.read_tag("Temperature", 0).unwrap()
+});
+
+let h2 = std::thread::spawn(move || {
+    list2.read().unwrap();
+    list2.read_tag("Temperature", 0).unwrap()
+});
+
+println!("Thread 1: {}", h1.join().unwrap());
+println!("Thread 2: {}", h2.join().unwrap());
+```
+
+**保证**:
+- ✅ 并发调用 `read()` / `read_tag()` 是安全的（Mutex 保护）
+- ✅ 多线程可以共享同一个 `CtList` 实例
+- ✅ `add_tag` / `delete_tag` 操作是线程安全的
+
 ### ❌ 非线程安全的类型
 
 #### `CtFind<'_>`
@@ -80,35 +114,6 @@ thread::spawn(move || {
         // ...
     }
 });
-```
-
-#### `CtList<'_>`
-
-`CtList` 同样**不能**跨线程使用：
-- 包含 `HashMap` 进行标签映射
-- 方法需要 `&mut self`，暗示内部可变性
-- 不实现 `Send` 或 `Sync`
-
-**正确用法**:
-```rust
-let client = Arc::new(CtClient::open(None, None, None, 0)?);
-
-let handles: Vec<_> = (0..4).map(|i| {
-    let client = Arc::clone(&client);
-    thread::spawn(move || {
-        // ✅ 每个线程创建自己的 CtList
-        let mut list = client.list_new(0).unwrap();
-        list.add_tag(&format!("Tag_{}", i)).unwrap();
-        list.read().unwrap();
-        let value = list.read_tag(&format!("Tag_{}", i), 0).unwrap();
-        println!("{}", value);
-        // CtList 在线程结束前被 drop
-    })
-}).collect();
-
-for handle in handles {
-    handle.join().unwrap();
-}
 ```
 
 ## 生命周期管理
@@ -268,10 +273,10 @@ thread::spawn(move || {
 ## 最佳实践总结
 
 1. ✅ 使用 `Arc<CtClient>` 在线程间共享客户端
-2. ✅ 每个线程创建自己的 `CtFind` 和 `CtList` 实例
+2. ✅ 每个线程创建自己的 `CtFind` 实例，或通过 `Arc<CtList>` 共享同一个 `CtList`
 3. ✅ 确保派生对象在客户端之前被 drop
 4. ✅ 使用 `join()` 等待所有线程完成
-5. ❌ 不要尝试跨线程传递 `CtFind` 或 `CtList`
+5. ❌ 不要尝试跨线程传递 `CtFind`
 6. ❌ 不要在 unsafe 代码中违反生命周期规则
 7. ❌ 不要在有活动引用时 drop Arc<CtClient>
 

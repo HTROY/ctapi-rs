@@ -34,7 +34,8 @@ pub trait TokioCtClient {
 
 ```rust
 pub trait TokioCtList {
-    async fn read_tokio(&mut self) -> Result<()>;
+    async fn read_tokio(&self) -> Result<()>;
+    async fn write_tag_tokio(&self, tag: &str, value: &str) -> Result<()>;
 }
 ```
 
@@ -143,7 +144,7 @@ use ctapi_rs::{CtClient, TokioCtList};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let client = CtClient::open(None, None, None, 0)?;
-    let mut list = client.list_new(0)?;
+    let list = client.list_new(0)?
     
     list.add_tag("Temperature")?;
     list.add_tag("Pressure")?;
@@ -369,7 +370,7 @@ impl ClientPool {
 
 ```rust
 // ✅ 好：批量读取
-let mut list = client.list_new(0)?;
+let list = client.list_new(0)?;
 for tag in &tags {
     list.add_tag(tag)?;
 }

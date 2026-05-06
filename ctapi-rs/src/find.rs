@@ -1,5 +1,5 @@
 //! Object search related implementation
-use anyhow::Result;
+use crate::error::Result;
 use ctapi_sys::*;
 use encoding_rs::*;
 use std::ffi::{CString, c_void};
@@ -47,6 +47,9 @@ impl Iterator for CtFind<'_> {
     type Item = FindObject;
 
     fn next(&mut self) -> Option<Self::Item> {
+        // SAFETY: The CtAPI handle and CString pointers are valid for the
+        // lifetime of `self`. find_object is a local stack variable whose
+        // address is valid for the duration of each FFI call.
         unsafe {
             if self.is_end {
                 return None;
@@ -130,6 +133,9 @@ impl FindObject {
         let mut buffer = [0u8; 256];
         let mut len: u32 = 0;
         let name = CString::new(GBK.encode(name.as_ref()).0)?;
+        // SAFETY: self.0 is a valid FindObject handle from ctFindFirst/ctFindNext.
+        // name is a GBK-encoded CString. buffer is a fixed-size stack array.
+        // len is a local stack variable.
         unsafe {
             if !ctGetProperty(
                 self.0,

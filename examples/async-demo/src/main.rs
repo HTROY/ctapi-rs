@@ -1,4 +1,5 @@
 use ctapi_rs::{AsyncCtClient, AsyncOperation, CtClient};
+use std::sync::Arc;
 
 const COMPUTER: &str = "127.0.0.1";
 const USER: &str = "Engineer";
@@ -7,7 +8,12 @@ const PASSWORD: &str = "Citect";
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Async CtAPI Demo ===\n");
 
-    let client = CtClient::open(Some(COMPUTER), Some(USER), Some(PASSWORD), 0)?;
+    let client = Arc::new(CtClient::open(
+        Some(COMPUTER),
+        Some(USER),
+        Some(PASSWORD),
+        0,
+    )?);
     println!("✓ Connected to Citect SCADA\n");
 
     // Example 1: Simple async cicode call
@@ -79,7 +85,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Example 4: Async list operations
     println!("Example 4: Async List Operations");
-    let mut list = client.list_new(0)?;
+    let list = Arc::clone(&client).list_new(0)?;
     list.add_tag("TagExt_DemoTag1")?;
     list.add_tag("TagExt_DemoTag1_Mirror")?;
     println!("  Added tags to list");

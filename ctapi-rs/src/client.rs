@@ -1,5 +1,6 @@
 //! Citect SCADA API client implementation
 use crate::error::{CtApiError, Result};
+use crate::util::encode_to_gbk_cstring;
 
 use ctapi_sys::*;
 use encoding_rs::*;
@@ -10,19 +11,16 @@ use std::io::Error;
 use std::ops::{Add, Sub};
 use std::os::windows::io::RawHandle;
 use std::os::windows::raw::HANDLE;
+use std::sync::Arc;
 
 const NULL: HANDLE = 0 as HANDLE;
 
-/// Helper function: Convert string to GBK encoded CString
-fn encode_to_gbk_cstring(s: &str) -> std::result::Result<CString, std::ffi::NulError> {
-    let (encoded, _, _) = GBK.encode(s);
-    CString::new(encoded)
-}
-
 /// Helper function: Safely extract string from buffer
 fn extract_string_from_buffer(buffer: &[i8]) -> std::result::Result<String, CtApiError> {
-    // Convert i8 array to u8 array to meet CStr::from_bytes_until_nul requirements
-    let u8_buffer: &[u8] = unsafe { std::mem::transmute(buffer) };
+    // SAFETY: i8 and u8 have identical layout (1 byte, alignment 1). The pointer
+    // comes from a live &[i8] reference, so it is valid for buffer.len() bytes.
+    let u8_buffer: &[u8] =
+        unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u8, buffer.len()) };
 
     // Create CStr, ensure null-terminated
     let cstr = CStr::from_bytes_until_nul(u8_buffer).map_err(CtApiError::FromBytesUntilNul)?;
@@ -66,7 +64,7 @@ fn decode_response_buffer(buffer: &[i8]) -> Result<String> {
 ///
 /// The `Send` and `Sync` implementations assume that CtAPI.dll functions are thread-safe
 /// for concurrent reads on the same handle. This is based on Citect SCADA documentation.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CtClient {
     handle: RawHandle,
 }
@@ -109,7 +107,7 @@ impl CtClient {
     ///
     /// # Examples
     /// ```no_run
-    /// use ctapi_rs::{CtClient, Result};
+    /// use ctapi_rs::CtClient;
     ///
     /// // Connect to local Citect SCADA
     /// let client = CtClient::open(None, None, None, 0)?;
@@ -137,6 +135,8 @@ impl CtClient {
         let user = user.and_then(|s| CString::new(s).ok());
         let password = password.and_then(|s| CString::new(s).ok());
 
+        // SAFETY: ctOpen is an FFI call. All CString pointers are valid for the
+        // duration of the call. mode is a valid u32 flag value.
         unsafe {
             let handle = ctOpen(
                 computer.unwrap_or_default().as_ptr(),
@@ -185,10 +185,14 @@ impl CtClient {
         let mut buffer = [0i8; 256];
 
         // Convert input tag to GBK encoding for compatibility
-        let tag = encode_to_gbk_cstring(tag.as_ref()).map_err(|_| CtApiError::TagNotFound {
-            tag: tag.as_ref().to_string(),
+        let tag = encode_to_gbk_cstring(tag.as_ref()).map_err(|_| CtApiError::InvalidParameter {
+            param: "tag".to_string(),
+            value: tag.as_ref().to_string(),
         })?;
 
+        // SAFETY: self.handle is a valid CtAPI connection handle. tag is a
+        // GBK-encoded CString valid for this call. buffer is a fixed-size
+        // stack array whose pointer and length are valid.
         unsafe {
             if !ctTagRead(
                 self.handle,
@@ -242,10 +246,14 @@ impl CtClient {
         tagvalue_items: &mut CtTagValueItems,
     ) -> Result<String> {
         let mut buffer = [0i8; 256];
-        let tag = encode_to_gbk_cstring(tag.as_ref()).map_err(|_| CtApiError::TagNotFound {
-            tag: tag.as_ref().to_string(),
+        let tag = encode_to_gbk_cstring(tag.as_ref()).map_err(|_| CtApiError::InvalidParameter {
+            param: "tag".to_string(),
+            value: tag.as_ref().to_string(),
         })?;
 
+        // SAFETY: self.handle is a valid CtAPI connection handle. tag is a
+        // GBK-encoded CString valid for this call. buffer is a fixed-size stack
+        // array. tagvalue_items is a mutable reference to a valid CtTagValueItems.
         unsafe {
             if !ctTagReadEx(
                 self.handle,
@@ -295,22 +303,24 @@ impl CtClient {
     /// client.tag_write_str("Pump_Start", "1")?;
     /// # Ok::<(), ctapi_rs::CtApiError>(())
     /// ```
-    pub fn tag_write<T, U>(&self, tag: T, value: U) -> Result<bool>
+    pub fn tag_write<T, U>(&self, tag: T, value: U) -> Result<()>
     where
         T: AsRef<str>,
         U: Display + Add<Output = U> + Sub<Output = U> + Copy + PartialEq,
     {
-        // Use helper function to optimize encoding process
-        let tag = encode_to_gbk_cstring(tag.as_ref()).map_err(|_| CtApiError::TagNotFound {
-            tag: tag.as_ref().to_string(),
+        let tag = encode_to_gbk_cstring(tag.as_ref()).map_err(|_| CtApiError::InvalidParameter {
+            param: "tag".to_string(),
+            value: tag.as_ref().to_string(),
         })?;
         let s_value = CString::new(value.to_string())?;
 
+        // SAFETY: self.handle is a valid CtAPI handle. tag and s_value are
+        // valid CStrings whose pointers are valid for the duration of this call.
         unsafe {
             if !ctTagWrite(self.handle, tag.as_ptr(), s_value.as_ptr()) {
                 return Err(std::io::Error::last_os_error().into());
             }
-            Ok(true)
+            Ok(())
         }
     }
 
@@ -341,20 +351,23 @@ impl CtClient {
     /// client.tag_write_str("Setpoint", "25.5")?;
     /// # Ok::<(), ctapi_rs::CtApiError>(())
     /// ```
-    pub fn tag_write_str<T: AsRef<str>>(&self, tag: T, value: &str) -> Result<bool> {
-        let tag = encode_to_gbk_cstring(tag.as_ref()).map_err(|_| CtApiError::TagNotFound {
-            tag: tag.as_ref().to_string(),
+    pub fn tag_write_str<T: AsRef<str>>(&self, tag: T, value: &str) -> Result<()> {
+        let tag = encode_to_gbk_cstring(tag.as_ref()).map_err(|_| CtApiError::InvalidParameter {
+            param: "tag".to_string(),
+            value: tag.as_ref().to_string(),
         })?;
         let s_value = encode_to_gbk_cstring(value).map_err(|_| CtApiError::InvalidParameter {
             param: "value".to_string(),
             value: value.to_string(),
         })?;
 
+        // SAFETY: self.handle is a valid CtAPI handle. tag and s_value are
+        // GBK-encoded CStrings whose pointers are valid for this call.
         unsafe {
             if !ctTagWrite(self.handle, tag.as_ptr(), s_value.as_ptr()) {
                 return Err(std::io::Error::last_os_error().into());
             }
-            Ok(true)
+            Ok(())
         }
     }
 
@@ -397,6 +410,9 @@ impl CtClient {
             value: cmd.to_string(),
         })?;
 
+        // SAFETY: self.handle is a valid CtAPI handle. cmd is a GBK-encoded
+        // CString. buffer is a fixed-size stack array. NULL OVERLAPPED pointer
+        // means synchronous execution.
         unsafe {
             if !ctCicode(
                 self.handle,
@@ -438,7 +454,24 @@ impl CtClient {
     }
 
     /// Create new list
-    pub fn list_new(&self, mode: u32) -> Result<super::CtList<'_>> {
+    ///
+    /// Takes ownership of an `Arc<CtClient>` so that [`CtList`] shares the same
+    /// reference-counted client.  This avoids a redundant `ctClose` call that
+    /// would occur if the client were cloned.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// use ctapi_rs::CtClient;
+    /// use std::sync::Arc;
+    ///
+    /// let client = Arc::new(CtClient::open(None, None, None, 0)?);
+    /// let list = Arc::clone(&client).list_new(0)?;
+    /// # Ok::<(), anyhow::Error>(())
+    /// ```
+    pub fn list_new(self: Arc<Self>, mode: u32) -> Result<super::CtList> {
+        // SAFETY: self.handle is a valid CtAPI connection handle. mode is a
+        // valid DWORD flag value. The returned handle is wrapped in CtList
+        // which manages its lifetime.
         unsafe {
             let handle = ctListNew(self.handle, mode);
             if handle.is_null() {
@@ -470,6 +503,9 @@ impl Drop for CtClient {
 
 /// Initialize resources for new CtAPI client instance
 pub fn ct_client_create() -> Result<CtClient> {
+    // SAFETY: ctClientCreate takes no parameters and returns a new CtAPI handle
+    // or null on failure. The handle is returned inside a CtClient which will
+    // call ctClose on drop.
     let handle = unsafe { ctClientCreate() };
 
     if handle.is_null() {
@@ -487,6 +523,8 @@ pub fn ct_client_create() -> Result<CtClient> {
 /// - `h_ctapi` has not been destroyed or freed previously
 /// - No other threads are concurrently using this handle
 pub unsafe fn ct_client_destroy(h_ctapi: HANDLE) -> Result<bool> {
+    // SAFETY: the caller guarantees h_ctapi is a valid HANDLE not concurrently
+    // in use. ctClientDestroy is a simple FFI call with no other preconditions.
     if !unsafe { ctClientDestroy(h_ctapi) } {
         return Err(Error::last_os_error().into());
     }

@@ -82,7 +82,7 @@ impl CtList {
     pub fn read_async(&self, async_op: &mut AsyncOperation) -> Result<()>
     
     pub fn write_tag_async(
-        &mut self,
+        &self,
         tag: &str,
         value: &str,
         async_op: &mut AsyncOperation,

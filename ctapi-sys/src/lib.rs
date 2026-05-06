@@ -22,7 +22,9 @@ pub struct OVERLAPPED {
 impl OVERLAPPED {
     /// Create a new zeroed OVERLAPPED structure
     pub fn new() -> Self {
-        unsafe { std::mem::zeroed() }
+        // SAFETY: all fields are integer or raw pointer types, for which
+        // the all-zeroes bit pattern is valid.
+        unsafe { std::mem::MaybeUninit::zeroed().assume_init() }
     }
 }
 
@@ -31,6 +33,12 @@ impl Default for OVERLAPPED {
         Self::new()
     }
 }
+
+// SAFETY: All fields are DWORD (u32) or raw pointers to external buffers/handles.
+// The raw pointers are opaque CtAPI identifiers, not references into Rust memory,
+// so there is no aliasing or ownership hazard when the struct is shared across threads.
+unsafe impl Send for OVERLAPPED {}
+unsafe impl Sync for OVERLAPPED {}
 
 #[derive(Clone, Copy, Debug)]
 #[repr(C, packed)]

@@ -25,7 +25,6 @@
 //! }
 //! ```
 
-use std::ffi::CString;
 use std::future::Future;
 use std::os::windows::io::RawHandle;
 use std::pin::Pin;
@@ -35,32 +34,15 @@ use std::task::{Context, Poll, Waker};
 
 use crate::CtClient;
 use crate::error::{CtApiError, Result};
+use crate::util::encode_to_gbk_cstring;
 use ctapi_sys::*;
 use encoding_rs::GBK;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::System::Threading::CreateEventA;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 /// `WaitForSingleObject` return value: timeout elapsed without the object being signalled.
 const WAIT_TIMEOUT: u32 = 0x0000_0102;
-
-// ───────────────────────────────────────────────
-// Internal helpers
-// ───────────────────────────────────────────────
-
-unsafe extern "system" {
-    fn CreateEventA(
-        lp_event_attributes: *mut std::ffi::c_void,
-        bManualReset: i32,
-        bInitialState: i32,
-        lp_name: *const u8,
-    ) -> HANDLE;
-}
-
-/// Helper function: Convert a Rust string to a GBK-encoded CString.
-fn encode_to_gbk_cstring(s: &str) -> std::result::Result<CString, std::ffi::NulError> {
-    let (encoded, _, _) = GBK.encode(s);
-    CString::new(encoded)
-}
 
 // ───────────────────────────────────────────────
 // WinEvent — Arc-wrapped Windows event handle
@@ -75,7 +57,10 @@ struct WinEvent(HANDLE);
 impl WinEvent {
     /// Create a new manual-reset, initially-unsignalled event.
     fn new() -> Self {
+        // SAFETY: CreateEventA with null security attributes, manual-reset,
+        // initially unsignalled, and no name is always safe to call.
         let h = unsafe { CreateEventA(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+        assert!(!h.is_null(), "CreateEventA failed");
         Self(h)
     }
 
@@ -89,6 +74,8 @@ impl WinEvent {
 impl Drop for WinEvent {
     fn drop(&mut self) {
         if !self.0.is_null() && self.0 as isize != -1 {
+            // SAFETY: self.0 is a valid HANDLE from CreateEventA. Arc<WinEvent>
+            // guarantees this drop runs only once after all references are gone.
             unsafe { CloseHandle(self.0) };
         }
     }
@@ -206,6 +193,12 @@ impl AsyncOperation {
         self.overlapped.dwStatus != STATUS_PENDING
     }
 
+    /// The raw Windows event handle associated with this operation's
+    /// OVERLAPPED structure. Signalled when the async operation completes.
+    pub(crate) fn win_event_handle(&self) -> HANDLE {
+        self.win_event.handle()
+    }
+
     /// Block until the operation completes and return the string result.
     ///
     /// # Parameters
@@ -254,6 +247,9 @@ impl AsyncOperation {
     pub fn try_get_result(&mut self, client: &CtClient) -> Option<Result<String>> {
         let mut bytes_transferred: u32 = 0;
 
+        // SAFETY: client.handle() is a valid CtAPI handle. &mut self.overlapped is
+        // a valid pointer to an OVERLAPPED struct that was previously passed to an
+        // async CtAPI call. bytes_transferred is a local stack variable.
         unsafe {
             if ctGetOverlappedResult(
                 client.handle(),
@@ -295,12 +291,14 @@ impl AsyncOperation {
     /// op.cancel(&client)?;
     /// # Ok::<(), ctapi_rs::CtApiError>(())
     /// ```
-    pub fn cancel(&mut self, client: &CtClient) -> Result<bool> {
+    pub fn cancel(&mut self, client: &CtClient) -> Result<()> {
+        // SAFETY: client.handle() is a valid CtAPI handle. &mut self.overlapped
+        // points to the OVERLAPPED struct associated with the pending operation.
         unsafe {
             if !ctCancelIO(client.handle(), &mut self.overlapped) {
                 return Err(std::io::Error::last_os_error().into());
             }
-            Ok(true)
+            Ok(())
         }
     }
 
@@ -324,6 +322,9 @@ impl AsyncOperation {
     /// completed (i.e. [`is_complete`] returned `true`).
     fn get_result_impl(&mut self, client_handle: RawHandle, wait: bool) -> Result<String> {
         let mut bytes_transferred: u32 = 0;
+        // SAFETY: client_handle is a valid CtAPI connection handle. &mut self.overlapped
+        // is a valid pointer to an OVERLAPPED struct from a previous async call.
+        // bytes_transferred is a local stack variable.
         unsafe {
             if !ctGetOverlappedResult(
                 client_handle,
@@ -415,26 +416,29 @@ impl std::fmt::Debug for AsyncOperation {
 /// }
 /// ```
 pub struct CtApiFuture {
-    client_handle: RawHandle,
-    async_op: AsyncOperation,
+    /// Owned clone of the CtClient handle.
+    client: CtClient,
+    /// Boxed so the OVERLAPPED struct is at a stable heap address.
+    /// CtAPI stores a raw `*mut OVERLAPPED` pointer to this struct
+    /// during async operations — moving the future must not move the
+    /// OVERLAPPED, otherwise CtAPI writes to a dangling pointer.
+    async_op: Box<AsyncOperation>,
     state: Option<Arc<FutureState>>,
 }
 
 impl CtApiFuture {
-    pub(crate) fn new(client_handle: RawHandle, async_op: AsyncOperation) -> Self {
+    pub(crate) fn new(client: &CtClient, async_op: AsyncOperation) -> Self {
         Self {
-            client_handle,
-            async_op,
+            client: client.clone(),
+            async_op: Box::new(async_op),
             state: None,
         }
     }
 }
 
-// SAFETY: The waker thread holds only Arc<WinEvent> + Arc<FutureState> (both Send).
-// `client_handle` (RawHandle = *mut c_void) is only dereferenced inside poll(),
-// which executes on the runtime's worker thread, never on the waker thread.
-// `AsyncOperation` raw pointers (OVERLAPPED.pData) point to heap-allocated Vec data
-// whose address does not change on move, and are likewise only accessed in poll().
+// SAFETY: CtClient is Send + Sync. Box<AsyncOperation> is Send because
+// its fields (OVERLAPPED: now Send + Sync, Vec<u8>: Send, Arc<WinEvent>: Send + Sync)
+// are all Send. Option<Arc<FutureState>> is auto-Send.
 unsafe impl Send for CtApiFuture {}
 
 impl Future for CtApiFuture {
@@ -445,7 +449,7 @@ impl Future for CtApiFuture {
 
         // Fast path — already done.
         if this.async_op.is_complete() {
-            return Poll::Ready(this.async_op.get_result_with_handle(this.client_handle));
+            return Poll::Ready(this.async_op.get_result_with_handle(this.client.handle()));
         }
 
         match &this.state {
@@ -462,13 +466,17 @@ impl Future for CtApiFuture {
                 let win_event = Arc::clone(&this.async_op.win_event);
                 let thread_state = Arc::clone(&state);
 
-                std::thread::spawn(move || {
+                std::thread::Builder::new()
+                    .name("ctapi-waker".into())
+                    .spawn(move || {
                     loop {
                         if thread_state.cancelled.load(Ordering::Relaxed) {
                             return;
                         }
                         // 100 ms timeout lets us check `cancelled` regularly
                         // so that dropping the future doesn't strand this thread.
+                        // SAFETY: win_event.handle() is a valid HANDLE from CreateEventA.
+                        // The Arc<WinEvent> keeps it alive for the thread's lifetime.
                         let status = unsafe { WaitForSingleObject(win_event.handle(), 100) };
 
                         if thread_state.cancelled.load(Ordering::Relaxed) {
@@ -477,16 +485,17 @@ impl Future for CtApiFuture {
 
                         if status != WAIT_TIMEOUT {
                             // Operation finished (or handle error) — wake the task.
-                            if let Ok(mut lock) = thread_state.waker.lock() {
-                                if let Some(waker) = lock.take() {
-                                    waker.wake();
-                                }
+                            if let Ok(mut lock) = thread_state.waker.lock()
+                                && let Some(waker) = lock.take()
+                            {
+                                waker.wake();
                             }
                             return;
                         }
                         // WAIT_TIMEOUT — loop and try again.
                     }
-                });
+                })
+                .expect("failed to spawn ctapi-waker thread");
             }
             Some(state) => {
                 // Subsequent polls (e.g. spurious wake-up): refresh the waker.
@@ -508,8 +517,11 @@ impl Drop for CtApiFuture {
         }
         // 2. Cancel the pending I/O to avoid a dangling OVERLAPPED pointer.
         if !self.async_op.is_complete() {
+            // SAFETY: self.client.handle() is a valid CtAPI handle.
+            // self.async_op.overlapped_mut() returns a pointer to the OVERLAPPED
+            // struct owned by this future. They remain valid until drop completes.
             unsafe {
-                let _ = ctCancelIO(self.client_handle, self.async_op.overlapped_mut());
+                let _ = ctCancelIO(self.client.handle(), self.async_op.overlapped_mut());
             }
         }
     }
@@ -579,6 +591,11 @@ impl AsyncCtClient for CtClient {
             value: cmd.to_string(),
         })?;
 
+        // SAFETY: self.handle() is a valid CtAPI connection handle. cmd is a
+        // GBK-encoded CString whose pointer is valid for this call. The buffer
+        // pointer and length come from async_op which outlives this call.
+        // async_op.overlapped_mut() returns a pointer to the OVERLAPPED struct
+        // that will track the async completion.
         unsafe {
             if !ctCicode(
                 self.handle(),
@@ -687,23 +704,25 @@ impl FutureCtClient for CtClient {
     fn cicode_future(&self, cmd: &str, vh_win: u32, mode: u32) -> Result<CtApiFuture> {
         let mut async_op = AsyncOperation::new();
         self.cicode_async(cmd, vh_win, mode, &mut async_op)?;
-        Ok(CtApiFuture::new(self.handle(), async_op))
+        Ok(CtApiFuture::new(self, async_op))
     }
 
     fn tag_write_future(&self, tag: &str, value: &str) -> Result<CtApiFuture> {
         let mut async_op = AsyncOperation::new();
 
-        let tag_cstr =
-            encode_to_gbk_cstring(tag).map_err(|_| CtApiError::InvalidParameter {
-                param: "tag".to_string(),
-                value: tag.to_string(),
-            })?;
+        let tag_cstr = encode_to_gbk_cstring(tag).map_err(|_| CtApiError::InvalidParameter {
+            param: "tag".to_string(),
+            value: tag.to_string(),
+        })?;
         let value_cstr =
             encode_to_gbk_cstring(value).map_err(|_| CtApiError::InvalidParameter {
                 param: "value".to_string(),
                 value: value.to_string(),
             })?;
 
+        // SAFETY: self.handle() is a valid CtAPI connection handle. tag_cstr
+        // and value_cstr are GBK-encoded CStrings valid for this call.
+        // async_op.overlapped_mut() returns a valid OVERLAPPED pointer.
         unsafe {
             if !ctTagWriteEx(
                 self.handle(),
@@ -719,7 +738,47 @@ impl FutureCtClient for CtClient {
             }
         }
 
-        Ok(CtApiFuture::new(self.handle(), async_op))
+        Ok(CtApiFuture::new(self, async_op))
+    }
+}
+
+impl FutureCtClient for Arc<CtClient> {
+    fn cicode_future(&self, cmd: &str, vh_win: u32, mode: u32) -> Result<CtApiFuture> {
+        let mut async_op = AsyncOperation::new();
+        (**self).cicode_async(cmd, vh_win, mode, &mut async_op)?;
+        Ok(CtApiFuture::new(self, async_op))
+    }
+
+    fn tag_write_future(&self, tag: &str, value: &str) -> Result<CtApiFuture> {
+        let mut async_op = AsyncOperation::new();
+
+        let tag_cstr = encode_to_gbk_cstring(tag).map_err(|_| CtApiError::InvalidParameter {
+            param: "tag".to_string(),
+            value: tag.to_string(),
+        })?;
+        let value_cstr =
+            encode_to_gbk_cstring(value).map_err(|_| CtApiError::InvalidParameter {
+                param: "value".to_string(),
+                value: value.to_string(),
+            })?;
+
+        // SAFETY: (**self).handle() is a valid CtAPI connection handle.
+        // tag_cstr and value_cstr are GBK-encoded CStrings valid for this call.
+        unsafe {
+            if !ctTagWriteEx(
+                (**self).handle(),
+                tag_cstr.as_ptr(),
+                value_cstr.as_ptr(),
+                async_op.overlapped_mut(),
+            ) {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(997) {
+                    return Err(err.into());
+                }
+            }
+        }
+
+        Ok(CtApiFuture::new(self, async_op))
     }
 }
 
@@ -765,12 +824,8 @@ mod tests {
 
     #[test]
     fn test_ct_api_future_debug() {
-        // We can't easily start a real operation here, but we can verify
-        // that the Debug impl compiles and runs without panicking.
-        let op = AsyncOperation::new();
-        let future = CtApiFuture::new(std::ptr::null_mut(), op);
-        let s = format!("{:?}", future);
-        assert!(s.contains("CtApiFuture"));
+        fn assert_debug<T: std::fmt::Debug>() {}
+        assert_debug::<CtApiFuture>();
     }
 
     #[test]

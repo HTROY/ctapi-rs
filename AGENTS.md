@@ -20,7 +20,8 @@ cargo run --example tokio-demo
 ## Thread Safety
 
 - `CtClient`: `Send + Sync` - safe to share across threads via `Arc`
-- `CtFind`, `CtList`: NOT `Send/Sync` - each thread must create its own instance
+- `CtFind`: NOT `Send/Sync` - each thread must create its own `CtFind` instance
+- `CtList`: `Send + Sync` - can be shared across threads via `Arc<CtList>`
 - Must destroy derived objects before dropping `CtClient`
 
 ## Testing

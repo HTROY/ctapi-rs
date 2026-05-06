@@ -43,8 +43,9 @@
 //! ```
 
 use crate::error::Result;
-use crate::{AsyncCtClient, AsyncOperation, CtClient, CtList, CtTagValueItems};
+use crate::{AsyncOperation, CtClient, CtList, CtTagValueItems};
 use std::sync::Arc;
+use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 // ───────────────────────────────────────────────
 // TokioCtClient
@@ -171,14 +172,9 @@ pub trait TokioCtClient {
 
 impl TokioCtClient for CtClient {
     async fn cicode_tokio(&self, cmd: &str, vh_win: u32, mode: u32) -> Result<String> {
-        let client = Arc::new(self.clone());
+        let client = self.clone();
         let cmd = cmd.to_string();
-        spawn_blocking_result(move || {
-            let mut op = AsyncOperation::new();
-            client.cicode_async(&cmd, vh_win, mode, &mut op)?;
-            op.get_result(&client)
-        })
-        .await
+        spawn_blocking_result(move || client.cicode(&cmd, vh_win, mode)).await
     }
 
     async fn tag_read_tokio(&self, tag: &str) -> Result<String> {
@@ -202,7 +198,7 @@ impl TokioCtClient for CtClient {
         let client = self.clone();
         let tag = tag.to_string();
         let value = value.to_string();
-        spawn_blocking_result(move || client.tag_write_str(&tag, &value).map(|_| ())).await
+        spawn_blocking_result(move || client.tag_write_str(&tag, &value)).await
     }
 }
 
@@ -212,12 +208,7 @@ impl TokioCtClient for Arc<CtClient> {
     async fn cicode_tokio(&self, cmd: &str, vh_win: u32, mode: u32) -> Result<String> {
         let client = Arc::clone(self);
         let cmd = cmd.to_string();
-        spawn_blocking_result(move || {
-            let mut op = AsyncOperation::new();
-            client.cicode_async(&cmd, vh_win, mode, &mut op)?;
-            op.get_result(&client)
-        })
-        .await
+        spawn_blocking_result(move || client.cicode(&cmd, vh_win, mode)).await
     }
 
     async fn tag_read_tokio(&self, tag: &str) -> Result<String> {
@@ -241,7 +232,7 @@ impl TokioCtClient for Arc<CtClient> {
         let client = Arc::clone(self);
         let tag = tag.to_string();
         let value = value.to_string();
-        spawn_blocking_result(move || client.tag_write_str(&tag, &value).map(|_| ())).await
+        spawn_blocking_result(move || client.tag_write_str(&tag, &value)).await
     }
 }
 
@@ -252,29 +243,42 @@ impl TokioCtClient for Arc<CtClient> {
 /// Extension trait providing `async`/`await`-compatible methods for
 /// [`CtList`].
 ///
-/// # Notes
+/// # Thread Safety
 ///
-/// [`CtList`] is not `Send` (it borrows from [`CtClient`] and holds mutable
-/// state), so methods that require crossing await points hold the list in the
-/// same task.  The read itself is performed via Windows OVERLAPPED I/O and
-/// polled with short [`tokio::time::sleep`] intervals.
+/// [`CtList`] is `Send + Sync` and can be safely shared across threads via
+/// `Arc<CtList>`.  Two implementations are provided:
+///
+/// - **`impl TokioCtList for CtList`** — uses Windows OVERLAPPED I/O with
+///   polling; best for single-task usage where the list is owned by one async
+///   context.
+/// - **`impl TokioCtList for Arc<CtList>`** — offloads the blocking call to
+///   Tokio's blocking-thread pool via [`tokio::task::spawn_blocking`]; best
+///   when the same list is shared across multiple Tokio tasks.
 ///
 /// # Examples
 ///
 /// ```no_run
 /// use ctapi_rs::{CtClient, TokioCtList};
+/// use std::sync::Arc;
 ///
 /// #[tokio::main]
 /// async fn main() -> anyhow::Result<()> {
-///     let client = CtClient::open(None, None, None, 0)?;
-///     let mut list = client.list_new(0)?;
+///     let client = Arc::new(CtClient::open(None, None, None, 0)?);
+///
+///     // Single-task usage (OVERLAPPED I/O, no extra thread)
+///     let list = Arc::clone(&client).list_new(0)?;
 ///     list.add_tag("Temperature")?;
 ///     list.add_tag("Pressure")?;
-///
 ///     list.read_tokio().await?;
-///
 ///     println!("Temp:  {}", list.read_tag("Temperature", 0)?);
 ///     println!("Press: {}", list.read_tag("Pressure",    0)?);
+///
+///     // Multi-task usage via Arc (spawn_blocking)
+///     let shared = Arc::new(Arc::clone(&client).list_new(0)?);
+///     shared.add_tag("FlowRate")?;
+///     let shared2 = Arc::clone(&shared);
+///     tokio::spawn(async move { shared2.read_tokio().await.unwrap() });
+///     shared.read_tokio().await?;
 ///     Ok(())
 /// }
 /// ```
@@ -282,49 +286,97 @@ impl TokioCtClient for Arc<CtClient> {
 pub trait TokioCtList {
     /// Read all tags in the list asynchronously.
     ///
-    /// Starts the OVERLAPPED read and awaits its completion using
-    /// [`tokio::time::sleep`] polling.
-    ///
     /// After this future resolves, call [`CtList::read_tag`] to retrieve
     /// individual values.
-    async fn read_tokio(&mut self) -> Result<()>;
+    async fn read_tokio(&self) -> Result<()>;
 
     /// Write a single tag in the list asynchronously.
     ///
     /// # Parameters
     /// * `tag`   - Tag name (must already be added via [`CtList::add_tag`]).
     /// * `value` - Value string to write.
-    async fn write_tag_tokio(&mut self, tag: &str, value: &str) -> Result<()>;
+    async fn write_tag_tokio(&self, tag: &str, value: &str) -> Result<()>;
 }
 
-impl<'a> TokioCtList for CtList<'a> {
-    async fn read_tokio(&mut self) -> Result<()> {
-        let mut op = AsyncOperation::new();
+/// OVERLAPPED-based implementation for owned/borrowed `CtList`.
+///
+/// Uses Windows OVERLAPPED I/O with event-driven wake via the OVERLAPPED
+/// event handle. A single Tokio blocking thread waits on the event and
+/// returns as soon as the operation completes — no polling latency.
+/// Suitable for single-task contexts.
+impl TokioCtList for CtList {
+    async fn read_tokio(&self) -> Result<()> {
+        // Box the AsyncOperation before starting so the OVERLAPPED struct
+        // lives at a stable heap address. CtAPI stores a raw pointer to it
+        // and writes completion data there — moving `op` after read_async
+        // would leave CtAPI with a dangling pointer.
+        let mut op = Box::new(AsyncOperation::new());
         self.read_async(&mut op)
             .map_err(|e| crate::error::CtApiError::Other {
                 code: 0,
                 message: e.to_string(),
             })?;
 
-        // Poll with a short sleep to yield control back to the runtime.
-        while !op.is_complete() {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        }
-        Ok(())
+        tokio::task::spawn_blocking(move || {
+            // SAFETY: op owns the WinEvent handle. WaitForSingleObject with
+            // INFINITE blocks until the OVERLAPPED operation signals the event.
+            unsafe { WaitForSingleObject(op.win_event_handle(), u32::MAX) };
+        })
+        .await
+        .map_err(|e| crate::error::CtApiError::Other {
+            code: 0,
+            message: e.to_string(),
+        })
     }
 
-    async fn write_tag_tokio(&mut self, tag: &str, value: &str) -> Result<()> {
-        let mut op = AsyncOperation::new();
+    async fn write_tag_tokio(&self, tag: &str, value: &str) -> Result<()> {
+        let mut op = Box::new(AsyncOperation::new());
         self.write_tag_async(tag, value, &mut op)
             .map_err(|e| crate::error::CtApiError::Other {
                 code: 0,
                 message: e.to_string(),
             })?;
 
-        while !op.is_complete() {
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        }
-        Ok(())
+        tokio::task::spawn_blocking(move || {
+            unsafe { WaitForSingleObject(op.win_event_handle(), u32::MAX) };
+        })
+        .await
+        .map_err(|e| crate::error::CtApiError::Other {
+            code: 0,
+            message: e.to_string(),
+        })
+    }
+}
+
+/// `spawn_blocking`-based implementation for `Arc<CtList>`.
+///
+/// Offloads the blocking CtAPI call to Tokio's blocking-thread pool, keeping
+/// the async runtime responsive.  Use this variant when a `CtList` is shared
+/// across multiple Tokio tasks.
+impl TokioCtList for Arc<CtList> {
+    async fn read_tokio(&self) -> Result<()> {
+        let list = Arc::clone(self);
+        spawn_blocking_result(move || {
+            list.read().map_err(|e| crate::error::CtApiError::Other {
+                code: 0,
+                message: e.to_string(),
+            })
+        })
+        .await
+    }
+
+    async fn write_tag_tokio(&self, tag: &str, value: &str) -> Result<()> {
+        let list = Arc::clone(self);
+        let tag = tag.to_string();
+        let value = value.to_string();
+        spawn_blocking_result(move || {
+            list.write_tag(&tag, &value)
+                .map_err(|e| crate::error::CtApiError::Other {
+                    code: 0,
+                    message: e.to_string(),
+                })
+        })
+        .await
     }
 }
 

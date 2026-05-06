@@ -6,7 +6,6 @@ use std::ffi::NulError;
 
 use std::ffi::FromBytesUntilNulError;
 use std::io;
-use std::str::Utf8Error;
 use thiserror::Error;
 
 /// CtAPI-specific error type
@@ -16,17 +15,13 @@ pub enum CtApiError {
     #[error("CtAPI system call failed: {0}")]
     System(#[from] io::Error),
 
-    /// UTF-8 encoding/decoding error
-    #[error("UTF-8 encoding/decoding error: {0}")]
-    Encoding(#[from] Utf8Error),
-
     /// Conversion error from bytes until null character
     #[error("Conversion error from bytes until null character: {0}")]
     FromBytesUntilNul(#[from] FromBytesUntilNulError),
 
-    /// Null pointer error
-    #[error("Null pointer error: {0}")]
-    NullPointer(#[from] NulError),
+    /// CString conversion failed (interior null byte)
+    #[error("Invalid C string: {0}")]
+    InvalidCString(#[from] NulError),
 
     /// Tag not found
     #[error("Tag '{tag}' not found")]
@@ -102,21 +97,6 @@ impl CtApiError {
     /// Check if this is a tag-related error
     pub fn is_tag_error(&self) -> bool {
         matches!(self, CtApiError::TagNotFound { .. })
-    }
-}
-
-/// Conversion From trait implementation
-impl From<String> for CtApiError {
-    fn from(tag: String) -> Self {
-        CtApiError::TagNotFound { tag }
-    }
-}
-
-impl From<&str> for CtApiError {
-    fn from(tag: &str) -> Self {
-        CtApiError::TagNotFound {
-            tag: tag.to_string(),
-        }
     }
 }
 

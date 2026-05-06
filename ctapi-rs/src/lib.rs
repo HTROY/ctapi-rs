@@ -18,23 +18,21 @@ pub mod error;
 pub mod find;
 pub mod list;
 pub mod scaling;
+mod util;
 
 #[cfg(feature = "tokio-support")]
 pub mod tokio_async;
 
 pub use crate::async_ops::{AsyncCtClient, AsyncOperation, CtApiFuture, FutureCtClient};
-pub use crate::client::*;
+pub use crate::client::{ct_client_create, ct_client_destroy, CtClient};
 pub use crate::constants::*;
 pub use crate::error::CtApiError;
-pub use crate::find::*;
-pub use crate::list::*;
-pub use crate::scaling::*;
+pub use crate::find::{CtFind, FindObject};
+pub use crate::list::CtList;
+pub use crate::scaling::{ct_eng_to_raw, ct_raw_to_eng};
 
 #[cfg(feature = "tokio-support")]
 pub use crate::tokio_async::{TokioCtClient, TokioCtList};
-
-// re-export anyhow::Result
-pub use anyhow::Result;
 
 // re-export commonly used types from ctapi_sys
 pub use ctapi_sys::CtHScale;
@@ -91,14 +89,40 @@ mod tests {
     #[ignore = "Requires actual Citect SCADA connection"]
     fn list_test() {
         let (computer, user, password) = get_connection_params();
-        let client =
-            CtClient::open(computer.as_deref(), user.as_deref(), password.as_deref(), 0).unwrap();
-        let mut list = client.list_new(0).unwrap();
+        let client = Arc::new(
+            CtClient::open(computer.as_deref(), user.as_deref(), password.as_deref(), 0).unwrap(),
+        );
+        let list = Arc::clone(&client).list_new(0).unwrap();
         list.add_tag("BIT_1").unwrap();
         list.read().unwrap();
         println!("{}", list.read_tag("BIT_1", 0).unwrap());
         let v = list.delete_tag("BIT_1");
         println!("{:?}", v);
+    }
+
+    #[test]
+    #[ignore = "Requires actual Citect SCADA connection"]
+    fn multi_thread_list_test() {
+        // Verify Arc<CtList> can be safely shared and used from multiple threads
+        let (computer, user, password) = get_connection_params();
+        let client = Arc::new(
+            CtClient::open(computer.as_deref(), user.as_deref(), password.as_deref(), 0).unwrap(),
+        );
+        let list = Arc::new(Arc::clone(&client).list_new(0).unwrap());
+        list.add_tag("BIT_1").unwrap();
+        let list1 = Arc::clone(&list);
+        let list2 = Arc::clone(&list);
+
+        let h1 = std::thread::spawn(move || {
+            list1.read().unwrap();
+            println!("thread1 BIT_1: {}", list1.read_tag("BIT_1", 0).unwrap());
+        });
+        let h2 = std::thread::spawn(move || {
+            list2.read().unwrap();
+            println!("thread2 BIT_1: {}", list2.read_tag("BIT_1", 0).unwrap());
+        });
+        h1.join().unwrap();
+        h2.join().unwrap();
     }
 
     #[test]

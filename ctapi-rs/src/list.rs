@@ -1,107 +1,212 @@
 //! Tag list operation related implementation
-use anyhow::{Result, anyhow};
+use super::CtClient;
+use crate::error::{CtApiError, Result};
 use ctapi_sys::*;
 use encoding_rs::*;
 use std::collections::HashMap;
 use std::ffi::{CStr, CString};
 use std::os::windows::io::RawHandle;
 use std::os::windows::raw::HANDLE;
+use std::sync::{Arc, RwLock};
 
 const NULL: HANDLE = 0 as HANDLE;
 
-/// Wrapper struct containing ctapi list handle
+/// Opaque CtAPI tag/list handle, explicitly made [`Send`] + [`Sync`].
+///
+/// # Safety
+///
+/// The handle is an opaque identifier obtained from `ctListNew` / `ctListAdd`
+/// that is only ever passed back to CtAPI functions.  Concurrent access is
+/// controlled by the enclosing [`CtList`] through its `RwLock`, so no data
+/// race is possible.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+struct ListHandle(RawHandle);
+unsafe impl Send for ListHandle {}
+unsafe impl Sync for ListHandle {}
+
+/// Wrapper struct containing a CtAPI list handle.
 ///
 /// # Thread Safety
 ///
-/// `CtList` is NOT thread-safe and should not be shared across threads.
-/// It contains a `HashMap` for tag mapping and mutable state that requires
-/// exclusive access. The CtAPI documentation states that `ctListDelete()` can
-/// be called while operations are pending in another thread, but this refers
-/// to different list instances, not concurrent access to the same list.
+/// `CtList` is [`Send`] + [`Sync`].
 ///
-/// For thread-safe list operations, create separate `CtList` instances per thread.
-#[derive(Debug)]
-pub struct CtList<'a> {
-    client: &'a super::CtClient,
-    handle: RawHandle,
-    tag_map: HashMap<String, RawHandle>,
+/// ## Lock strategy
+///
+/// | Field      | Synchronization | Rationale |
+/// |------------|-----------------|-----------|
+/// | `handle`   | **None** (immutable after `new`) | The list handle from `ctListNew` never changes; direct access is safe from any thread. |
+/// | `tag_map`  | **[`RwLock`]**  | Tag lookups (`read_tag`, `write_tag`) vastly outnumber structural changes (`add_tag`, `delete_tag`). A `RwLock` lets multiple readers proceed in parallel while writes remain exclusive. |
+///
+/// As a result:
+/// - `read()` / `read_async()` are **completely lock-free**.
+/// - `read_tag()` / `write_tag()` acquire a **shared read lock** — multiple
+///   threads can call them simultaneously.
+/// - `add_tag()` / `delete_tag()` acquire an **exclusive write lock** — they
+///   serialize against each other and against concurrent readers, but these
+///   operations are rare in practice.
+///
+/// ## Concurrent usage — TOCTOU awareness
+///
+/// Between a `read()` call returning and a subsequent `read_tag()` call,
+/// another thread may add or delete tags. This means `read_tag()` can
+/// return [`TagNotFound`](crate::CtApiError::TagNotFound) for a tag that
+/// existed when `read()` was called but was deleted before `read_tag()` ran.
+/// This is inherent to lock-free reads and is consistent with the CtAPI
+/// guarantee that tag data is valid until the next `ctListRead`.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ctapi_rs::CtClient;
+/// use std::sync::Arc;
+///
+/// let client = Arc::new(CtClient::open(None, None, None, 0)?);
+/// let list = Arc::new(Arc::clone(&client).list_new(0)?);
+/// list.add_tag("Temperature")?;
+/// list.add_tag("Pressure")?;
+/// list.read()?;
+///
+/// // Multiple threads can call read_tag concurrently.
+/// let list2 = Arc::clone(&list);
+/// let t = std::thread::spawn(move || list2.read_tag("Temperature", 0).unwrap());
+/// println!("Pressure: {}", list.read_tag("Pressure", 0)?);
+/// println!("Temperature: {}", t.join().unwrap());
+/// # Ok::<(), anyhow::Error>(())
+/// ```
+pub struct CtList {
+    client: Arc<CtClient>,
+    /// The CtAPI list handle returned by `ctListNew`.
+    /// Immutable after construction — no lock required.
+    handle: ListHandle,
+    /// Tag name → per-tag handle returned by `ctListAdd`.
+    ///
+    /// `RwLock` instead of `Mutex` because tag reads vastly outnumber
+    /// tag additions / removals in typical usage.
+    tag_map: RwLock<HashMap<String, ListHandle>>,
 }
 
-impl<'a> CtList<'a> {
-    pub(super) fn new(client: &'a super::CtClient, handle: RawHandle) -> Self {
+impl std::fmt::Debug for CtList {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let tag_map = self.tag_map.read().expect("CtList tag_map RwLock poisoned");
+        f.debug_struct("CtList")
+            .field("handle", &self.handle.0)
+            .field("tag_count", &tag_map.len())
+            .finish()
+    }
+}
+
+impl CtList {
+    pub(super) fn new(client: Arc<CtClient>, handle: RawHandle) -> Self {
         Self {
             client,
-            handle,
-            tag_map: HashMap::new(),
+            handle: ListHandle(handle),
+            tag_map: RwLock::new(HashMap::new()),
         }
     }
 
     /// Add tag or tag element to list
     ///
-    /// Once tags are added to the list, they can be read using ctListRead() and written using ctListWrite().
-    /// If a read is already pending, tags will not be read until next call to ctListRead().
-    /// ctListWrite() can be called immediately after ctListAdd() function completes.
-    pub fn add_tag<T: AsRef<str>>(&mut self, tag: T) -> Result<()> {
+    /// Once tags are added to the list, they can be read using ctListRead() and
+    /// written using ctListWrite().  If a read is already pending, tags will
+    /// not be read until next call to ctListRead().  ctListWrite() can be
+    /// called immediately after ctListAdd() completes.
+    ///
+    /// Acquires an **exclusive write lock** on the tag map.
+    pub fn add_tag<T: AsRef<str>>(&self, tag: T) -> Result<()> {
         let ctag = CString::new(GBK.encode(tag.as_ref()).0)?;
+        let mut tag_map = self
+            .tag_map
+            .write()
+            .expect("CtList tag_map RwLock poisoned");
+        // SAFETY: self.handle.0 is a valid CtAPI list handle. ctag is a
+        // GBK-encoded CString whose pointer is valid for this call.
         unsafe {
-            let handle = ctListAdd(self.handle, ctag.as_ptr());
+            let handle = ctListAdd(self.handle.0, ctag.as_ptr());
             if handle.is_null() {
                 return Err(std::io::Error::last_os_error().into());
             }
-            self.tag_map.insert(tag.as_ref().to_owned(), handle);
+            tag_map.insert(tag.as_ref().to_owned(), ListHandle(handle));
         }
         Ok(())
     }
 
     /// Add tag (extended version with more parameters)
     ///
-    /// Besides ctListAdd functionality, also supports setting raw value flag, polling period and deadband.
-    /// If using ctListAdd, default polling period is 500ms, raw value flag defaults to engineering value FALSE.
+    /// Besides ctListAdd functionality, also supports setting raw value flag,
+    /// polling period and deadband.  If using ctListAdd, default polling
+    /// period is 500ms, raw value flag defaults to engineering value FALSE.
+    ///
+    /// Acquires an **exclusive write lock** on the tag map.
     pub fn add_tag_ex<T: AsRef<str>>(
-        &mut self,
+        &self,
         tag: T,
         raw: bool,
         poll_period: i32,
         deadband: f64,
     ) -> Result<()> {
         let ctag = CString::new(GBK.encode(tag.as_ref()).0)?;
+        let mut tag_map = self
+            .tag_map
+            .write()
+            .expect("CtList tag_map RwLock poisoned");
+        // SAFETY: self.handle.0 is a valid CtAPI list handle. ctag is a
+        // GBK-encoded CString. raw, poll_period, deadband are primitive
+        // values matching the CtAPI parameter types.
         unsafe {
-            let handle = ctListAddEx(self.handle, ctag.as_ptr(), raw, poll_period, deadband);
+            let handle = ctListAddEx(self.handle.0, ctag.as_ptr(), raw, poll_period, deadband);
             if handle.is_null() {
                 return Err(std::io::Error::last_os_error().into());
             }
-            self.tag_map.insert(tag.as_ref().to_owned(), handle);
+            tag_map.insert(tag.as_ref().to_owned(), ListHandle(handle));
         }
         Ok(())
     }
 
     /// Delete tag created with ctListAdd
     ///
-    /// Program can call ctListDelete() while there are pending reads or writes in another thread.
-    /// ctListWrite() and ctListRead() will return after tag deletion.
-    pub fn delete_tag<T: AsRef<str>>(&mut self, tag: T) -> Result<()> {
-        match self.tag_map.get(tag.as_ref()) {
-            Some(handle) => unsafe {
-                if !ctListDelete(*handle) {
+    /// Program can call ctListDelete() while there are pending reads or writes
+    /// in another thread.  ctListWrite() and ctListRead() will return after
+    /// tag deletion.
+    ///
+    /// Acquires an **exclusive write lock** on the tag map.
+    pub fn delete_tag<T: AsRef<str>>(&self, tag: T) -> Result<()> {
+        let mut tag_map = self
+            .tag_map
+            .write()
+            .expect("CtList tag_map RwLock poisoned");
+        match tag_map.get(tag.as_ref()) {
+            Some(handle) =>
+            // SAFETY: handle.0 is a valid tag handle from ctListAdd/ctListAddEx.
+            // The write lock on tag_map prevents concurrent access.
+            unsafe {
+                if !ctListDelete(handle.0) {
                     return Err(std::io::Error::last_os_error().into());
                 }
-                self.tag_map.remove(tag.as_ref());
+                tag_map.remove(tag.as_ref());
                 Ok(())
             },
-            None => Err(anyhow!("Tag:{} not found", tag.as_ref())),
+            None => Err(CtApiError::TagNotFound {
+                tag: tag.as_ref().to_string(),
+            }),
         }
     }
 
     /// Read tags in list
     ///
-    /// This function will read tags attached to the list. Once data is read from I/O device,
-    /// ctListData() can be called to get tag values. If reading is not successful,
-    /// ctListData() will return errors for tags that cannot be read.
+    /// This function will read tags attached to the list.  Once data is read
+    /// from I/O device, ctListData() can be called to get tag values.  If
+    /// reading is not successful, ctListData() will return errors for tags
+    /// that cannot be read.
     ///
     /// Tags can be added and removed from list while ctListRead() is pending.
+    ///
+    /// **Lock-free**: accesses the immutable list handle directly.
     pub fn read(&self) -> Result<()> {
+        // SAFETY: self.handle.0 is a valid CtAPI list handle. NULL OVERLAPPED
+        // pointer means synchronous (blocking) read.
         unsafe {
-            if !ctListRead(self.handle, NULL as *mut OVERLAPPED) {
+            if !ctListRead(self.handle.0, NULL as *mut OVERLAPPED) {
                 Err(std::io::Error::last_os_error().into())
             } else {
                 Ok(())
@@ -111,26 +216,26 @@ impl<'a> CtList<'a> {
 
     /// Read tags in list asynchronously
     ///
-    /// Non-blocking version of `read()`. The read operation will start and complete
-    /// in the background. Use `AsyncOperation::get_result()` or poll for completion.
+    /// Non-blocking version of [`read`].  The read operation starts and
+    /// completes in the background.  Use [`AsyncOperation::get_result`] or
+    /// poll for completion.
+    ///
+    /// **Lock-free**: accesses the immutable list handle directly.
     ///
     /// # Parameters
-    /// * `async_op` - AsyncOperation to track this read operation
-    ///
-    /// # Return Value
-    /// Returns `Ok(())` if the read operation was started successfully.
+    /// * `async_op` - [`AsyncOperation`](crate::AsyncOperation) to track this operation.
     ///
     /// # Examples
     /// ```no_run
     /// # use ctapi_rs::{CtClient, AsyncOperation};
-    /// let client = CtClient::open(None, None, None, 0)?;
-    /// let mut list = client.list_new(0)?;
+    /// # use std::sync::Arc;
+    /// let client = Arc::new(CtClient::open(None, None, None, 0)?);
+    /// let list = Arc::clone(&client).list_new(0)?;
     /// list.add_tag("Tag1")?;
     ///
     /// let mut async_op = AsyncOperation::new();
     /// list.read_async(&mut async_op)?;
     ///
-    /// // Wait for completion
     /// while !async_op.is_complete() {
     ///     std::thread::sleep(std::time::Duration::from_millis(10));
     /// }
@@ -139,10 +244,11 @@ impl<'a> CtList<'a> {
     /// # Ok::<(), anyhow::Error>(())
     /// ```
     pub fn read_async(&self, async_op: &mut crate::AsyncOperation) -> Result<()> {
+        // SAFETY: self.handle.0 is a valid CtAPI list handle. async_op.overlapped_mut()
+        // returns a valid OVERLAPPED pointer that tracks async completion.
         unsafe {
-            if !ctListRead(self.handle, async_op.overlapped_mut()) {
+            if !ctListRead(self.handle.0, async_op.overlapped_mut()) {
                 let error = std::io::Error::last_os_error();
-                // ERROR_IO_PENDING (997) is expected for async operations
                 if error.raw_os_error() != Some(997) {
                     return Err(error.into());
                 }
@@ -153,13 +259,20 @@ impl<'a> CtList<'a> {
 
     /// Get values of tags in list
     ///
-    /// Call this function after ctListRead() completes for added tags.
+    /// Call this function after [`read`] completes for added tags.
+    ///
+    /// Acquires a **shared read lock** on the tag map — multiple threads may
+    /// call `read_tag` concurrently without blocking each other.
     pub fn read_tag<T: AsRef<str>>(&self, tag: T, mode: u32) -> Result<String> {
-        match self.tag_map.get(tag.as_ref()) {
-            Some(handle) => unsafe {
+        let tag_map = self.tag_map.read().expect("CtList tag_map RwLock poisoned");
+        match tag_map.get(tag.as_ref()) {
+            Some(handle) =>
+            // SAFETY: handle.0 is a valid tag handle from ctListAdd. buffer is a
+            // fixed-size stack array. mode is a valid DWORD flag.
+            unsafe {
                 let mut buffer = [0u8; 256];
                 if !ctListData(
-                    *handle,
+                    handle.0,
                     buffer.as_mut_ptr().cast(),
                     buffer.len() as DWORD,
                     mode,
@@ -171,58 +284,59 @@ impl<'a> CtList<'a> {
                     .0
                     .to_string())
             },
-            None => Err(anyhow!("Tag:{} not found!", tag.as_ref())),
+            None => Err(CtApiError::TagNotFound {
+                tag: tag.as_ref().to_string(),
+            }),
         }
     }
 
     /// Write single tag in list
-    pub fn write_tag<T: AsRef<str>>(
-        &self,
-        tag: T,
-        value: T,
-        overlapped: Option<&mut OVERLAPPED>,
-    ) -> Result<()> {
-        if let Some(handle) = self.tag_map.get(tag.as_ref()) {
-            let value = CString::new(GBK.encode(value.as_ref()).0)?;
-            match overlapped {
-                Some(overlapped) => unsafe {
-                    if !ctListWrite(*handle, value.as_ptr(), overlapped) {
-                        return Err(std::io::Error::last_os_error().into());
-                    }
-                },
-                None => unsafe {
-                    if !ctListWrite(*handle, value.as_ptr(), NULL as *mut OVERLAPPED) {
-                        return Err(std::io::Error::last_os_error().into());
-                    }
-                },
+    ///
+    /// Acquires a **shared read lock** on the tag map — multiple threads may
+    /// call `write_tag` concurrently without blocking each other.
+    pub fn write_tag<T: AsRef<str>>(&self, tag: T, value: T) -> Result<()> {
+        let tag_map = self.tag_map.read().expect("CtList tag_map RwLock poisoned");
+        if let Some(handle) = tag_map.get(tag.as_ref()) {
+            let cvalue = CString::new(GBK.encode(value.as_ref()).0)?;
+            // SAFETY: handle.0 is a valid tag handle. cvalue is a GBK-encoded
+            // CString. NULL OVERLAPPED means synchronous write.
+            unsafe {
+                if !ctListWrite(handle.0, cvalue.as_ptr(), NULL as *mut OVERLAPPED) {
+                    return Err(std::io::Error::last_os_error().into());
+                }
             }
             Ok(())
         } else {
-            Err(anyhow!("{}", tag.as_ref()))
+            Err(CtApiError::TagNotFound {
+                tag: tag.as_ref().to_string(),
+            })
         }
     }
 
     /// Write single tag in list asynchronously
     ///
-    /// Non-blocking version of `write_tag()`. The write operation will complete
-    /// in the background.
+    /// Non-blocking version of [`write_tag`].  The write completes in the
+    /// background.
+    ///
+    /// Acquires a **shared read lock** on the tag map — multiple threads may
+    /// call `write_tag_async` concurrently without blocking each other.
     ///
     /// # Parameters
-    /// * `tag` - Tag name to write
-    /// * `value` - Value to write
-    /// * `async_op` - AsyncOperation to track this write operation
+    /// * `tag`      - Tag name to write.
+    /// * `value`    - Value to write.
+    /// * `async_op` - [`AsyncOperation`](crate::AsyncOperation) to track this operation.
     ///
     /// # Examples
     /// ```no_run
     /// # use ctapi_rs::{CtClient, AsyncOperation};
-    /// let client = CtClient::open(None, None, None, 0)?;
-    /// let mut list = client.list_new(0)?;
+    /// # use std::sync::Arc;
+    /// let client = Arc::new(CtClient::open(None, None, None, 0)?);
+    /// let list = Arc::clone(&client).list_new(0)?;
     /// list.add_tag("Tag1")?;
     ///
     /// let mut async_op = AsyncOperation::new();
     /// list.write_tag_async("Tag1", "42", &mut async_op)?;
     ///
-    /// // Wait for completion if needed
     /// while !async_op.is_complete() {
     ///     std::thread::sleep(std::time::Duration::from_millis(10));
     /// }
@@ -234,12 +348,14 @@ impl<'a> CtList<'a> {
         value: T,
         async_op: &mut crate::AsyncOperation,
     ) -> Result<()> {
-        if let Some(handle) = self.tag_map.get(tag.as_ref()) {
-            let value = CString::new(GBK.encode(value.as_ref()).0)?;
+        let tag_map = self.tag_map.read().expect("CtList tag_map RwLock poisoned");
+        if let Some(handle) = tag_map.get(tag.as_ref()) {
+            let cvalue = CString::new(GBK.encode(value.as_ref()).0)?;
+            // SAFETY: handle.0 is a valid tag handle. cvalue is a GBK-encoded
+            // CString. async_op.overlapped_mut() returns a valid OVERLAPPED pointer.
             unsafe {
-                if !ctListWrite(*handle, value.as_ptr(), async_op.overlapped_mut()) {
+                if !ctListWrite(handle.0, cvalue.as_ptr(), async_op.overlapped_mut()) {
                     let error = std::io::Error::last_os_error();
-                    // ERROR_IO_PENDING (997) is expected for async operations
                     if error.raw_os_error() != Some(997) {
                         return Err(error.into());
                     }
@@ -247,60 +363,33 @@ impl<'a> CtList<'a> {
             }
             Ok(())
         } else {
-            Err(anyhow!("Tag '{}' not found in list", tag.as_ref()))
+            Err(CtApiError::TagNotFound {
+                tag: tag.as_ref().to_string(),
+            })
         }
     }
 }
 
-impl Drop for CtList<'_> {
+impl Drop for CtList {
     fn drop(&mut self) {
-        // SAFETY: Safe to call ctListFree on a valid handle.
-        // Since CtList is not Send/Sync, it cannot be accessed from multiple threads.
-        // The handle is valid because it was created by ctListNew.
-        unsafe {
-            if !self.handle.is_null() {
-                ctListFree(self.handle);
-                // Note: ctListFree doesn't return a success indicator,
-                // so we can't detect errors here
-            }
+        if !self.handle.0.is_null() {
+            // Safety: the handle was created by ctListNew and is valid.
+            // `handle` is a plain field — no lock needed in Drop.
+            // Arc guarantees Drop runs only after all clones are gone,
+            // so no other thread can be using the handle concurrently.
+            unsafe { ctListFree(self.handle.0) };
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
-    use std::os::windows::io::RawHandle;
-
     #[test]
-    fn test_ct_list_debug() {
-        // Since CtClient field is private, we only test basic functionality of struct
-        // Don't create actual CtList instance
-
-        // Test struct Debug implementation
-        assert_eq!(1 + 1, 2); // Placeholder test
-    }
-
-    #[test]
-    fn test_tag_map_functionality() {
-        // Test HashMap basic functionality (used inside CtList)
-        let mut map = HashMap::new();
-
-        // Test empty mapping
-        assert_eq!(map.len(), 0);
-
-        // Test insertion
-        let mock_handle: RawHandle = std::ptr::null_mut();
-        map.insert("test_tag".to_string(), mock_handle);
-
-        assert_eq!(map.len(), 1);
-        assert!(map.contains_key("test_tag"));
-    }
-
-    #[test]
-    fn test_tag_not_found_error() {
-        // Test error handling logic
-        let error_msg = "Tag:nonexistent_tag not found";
-        assert!(error_msg.contains("not found"));
-        assert!(error_msg.contains("nonexistent_tag"));
+    fn test_list_thread_safety() {
+        // Verify Send + Sync at compile time.
+        fn assert_send<T: Send>() {}
+        fn assert_sync<T: Sync>() {}
+        assert_send::<super::CtList>();
+        assert_sync::<super::CtList>();
     }
 }

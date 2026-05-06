@@ -209,7 +209,7 @@ async fn demo_tag_read_ex(client: &Arc<CtClient>) -> anyhow::Result<()> {
 
 /// Demo 6: Async list operations with `TokioCtList`.
 async fn demo_list_operations(client: &Arc<CtClient>) -> anyhow::Result<()> {
-    let mut list = client.list_new(0)?;
+    let list = Arc::clone(client).list_new(0)?;
 
     let tags = vec!["BIT_1", "BIT_2", "BIT_3"];
     for tag in &tags {
