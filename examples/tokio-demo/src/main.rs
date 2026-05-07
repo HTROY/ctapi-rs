@@ -6,7 +6,7 @@
 //!
 //! Note: This demo will fail to connect without a running Citect SCADA instance.
 
-use ctapi_rs::{CtClient, FutureCtClient, TokioCtClient, TokioCtList};
+use ctapi_rs::{CtClient, FutureCtClient, FutureCtList, TokioCtClient, TokioCtList};
 use std::sync::Arc;
 use tokio::time::Duration;
 
@@ -98,6 +98,14 @@ async fn main() -> anyhow::Result<()> {
     match demo_concurrent_futures(&client.clone()).await {
         Ok(_) => println!("✓ Demo 9 completed\n"),
         Err(e) => eprintln!("✗ Demo 9 failed: {}\n", e),
+    }
+
+    // ── Demo 10: FutureCtList — OVERLAPPED list read/write ───────────────────
+    println!("Demo 10: FutureCtList — OVERLAPPED-based list operations");
+    println!("----------------------------------------------------------");
+    match demo_future_list(&client.clone()).await {
+        Ok(_) => println!("✓ Demo 10 completed\n"),
+        Err(e) => eprintln!("✗ Demo 10 failed: {}\n", e),
     }
 
     println!("=== All demos completed ===");
@@ -299,6 +307,50 @@ async fn demo_concurrent_futures(client: &Arc<CtClient>) -> anyhow::Result<()> {
     println!("  time    = {}", time);
     println!("  date    = {}", date);
     println!("  version = {}", version);
+
+    Ok(())
+}
+
+/// Demo 10: `FutureCtList` drives list read/write with Windows OVERLAPPED I/O,
+/// just like `FutureCtClient` does for Cicode calls.  No `spawn_blocking` is
+/// needed — a lightweight waker thread signals the future when the OVERLAPPED
+/// event completes.
+async fn demo_future_list(client: &Arc<CtClient>) -> anyhow::Result<()> {
+    let list = Arc::clone(client).list_new(0)?;
+
+    let tags = vec!["BIT_1", "BIT_2", "BIT_3"];
+    for tag in &tags {
+        list.add_tag(tag)?;
+    }
+    println!("  Added {} tags to list", tags.len());
+
+    // ── OVERLAPPED-based read (no spawn_blocking) ─────────────────────────
+    list.read_future()?.await?;
+    println!("  Read complete (OVERLAPPED):");
+
+    for tag in &tags {
+        match list.read_tag(tag, 0) {
+            Ok(value) => println!("    {} = {}", tag, value),
+            Err(e) => eprintln!("    {} → error: {}", tag, e),
+        }
+    }
+
+    // ── OVERLAPPED-based write ────────────────────────────────────────────
+    list.write_tag_future("BIT_1", "1")?.await?;
+    println!("  Wrote BIT_1 = 1 via OVERLAPPED  ✓");
+
+    // Verify
+    list.read_future()?.await?;
+    let bit1 = list.read_tag("BIT_1", 0)?;
+    println!("  BIT_1 after write: {}", bit1);
+
+    // ── Concurrent read + write via try_join! ─────────────────────────────
+    println!("  Concurrent read + write via try_join!:");
+    let ((), ()) = tokio::try_join!(
+        list.read_future()?,
+        list.write_tag_future("BIT_1", "0")?,
+    )?;
+    println!("  Concurrent ops completed  ✓");
 
     Ok(())
 }

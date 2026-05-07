@@ -105,6 +105,14 @@ impl CtList {
         }
     }
 
+    /// Return a clone of the underlying [`Arc<CtClient>`] for this list.
+    ///
+    /// Used internally by [`CtListFuture`](crate::CtListFuture) to keep the
+    /// CtAPI connection alive and to cancel pending operations via `ctCancelIO`.
+    pub(crate) fn client_arc(&self) -> Arc<CtClient> {
+        Arc::clone(&self.client)
+    }
+
     /// Add tag or tag element to list
     ///
     /// Once tags are added to the list, they can be read using ctListRead() and

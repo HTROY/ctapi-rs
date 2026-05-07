@@ -33,6 +33,7 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
 
 use crate::CtClient;
+use crate::CtList;
 use crate::error::{CtApiError, Result};
 use crate::util::encode_to_gbk_cstring;
 use ctapi_sys::*;
@@ -795,6 +796,226 @@ impl FutureCtClient for Arc<CtClient> {
         }
 
         Ok(CtApiFuture::from_boxed(self, async_op))
+    }
+}
+
+// ───────────────────────────────────────────────
+// CtListFuture — std::future::Future over OVERLAPPED for CtList operations
+// ───────────────────────────────────────────────
+
+/// A [`Future`] that wraps an in-progress CtAPI OVERLAPPED async list operation.
+///
+/// Created by [`FutureCtList`] methods. Supports `.await` in any async context
+/// without requiring Tokio — a lightweight background thread waits on the
+/// Windows event handle and wakes the task when the operation completes.
+///
+/// # Cancellation
+///
+/// Dropping this future before it resolves will:
+/// 1. Signal the internal waker thread to stop.
+/// 2. Call `ctCancelIO` to cancel the pending I/O operation.
+///
+/// # Thread Safety
+///
+/// `CtListFuture` implements [`Send`] — it can be spawned in Tokio tasks or any
+/// other multi-threaded async runtime.
+pub struct CtListFuture {
+    /// Keeps the CtAPI connection alive for the lifetime of this future.
+    client: Arc<CtClient>,
+    async_op: Box<AsyncOperation>,
+    state: Option<Arc<FutureState>>,
+    finished: bool,
+}
+
+impl CtListFuture {
+    fn new(client: Arc<CtClient>, async_op: Box<AsyncOperation>) -> Self {
+        Self {
+            client,
+            async_op,
+            state: None,
+            finished: false,
+        }
+    }
+}
+
+// SAFETY: Arc<CtClient> is Send + Sync. Box<AsyncOperation> is Send.
+// Option<Arc<FutureState>> is auto-Send.
+unsafe impl Send for CtListFuture {}
+
+impl Future for CtListFuture {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+
+        if this.async_op.is_complete() {
+            this.finished = true;
+            return Poll::Ready(Ok(()));
+        }
+
+        match &this.state {
+            None => {
+                let state = Arc::new(FutureState {
+                    waker: Mutex::new(Some(cx.waker().clone())),
+                    cancelled: AtomicBool::new(false),
+                });
+                this.state = Some(Arc::clone(&state));
+
+                let win_event = Arc::clone(&this.async_op.win_event);
+                let thread_state = Arc::clone(&state);
+
+                std::thread::Builder::new()
+                    .name("ctapi-list-waker".into())
+                    .spawn(move || {
+                        loop {
+                            if thread_state.cancelled.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            // SAFETY: win_event.handle() is a valid HANDLE from CreateEventA.
+                            let status = unsafe { WaitForSingleObject(win_event.handle(), 100) };
+
+                            if thread_state.cancelled.load(Ordering::Relaxed) {
+                                return;
+                            }
+
+                            if status != WAIT_TIMEOUT {
+                                if let Ok(mut lock) = thread_state.waker.lock()
+                                    && let Some(waker) = lock.take()
+                                {
+                                    waker.wake();
+                                }
+                                return;
+                            }
+                        }
+                    })
+                    .expect("failed to spawn ctapi-list-waker thread");
+            }
+            Some(state) => {
+                if let Ok(mut lock) = state.waker.lock() {
+                    *lock = Some(cx.waker().clone());
+                }
+            }
+        }
+
+        Poll::Pending
+    }
+}
+
+impl Drop for CtListFuture {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        if let Some(state) = &self.state {
+            state.cancelled.store(true, Ordering::Relaxed);
+        }
+        if !self.async_op.is_complete() {
+            // SAFETY: self.client.handle() is a valid CtAPI handle. The OVERLAPPED
+            // pointer is from self.async_op which is Box-allocated and stable.
+            unsafe {
+                let _ = ctCancelIO(self.client.handle(), self.async_op.overlapped_mut());
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for CtListFuture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CtListFuture")
+            .field("is_complete", &self.async_op.is_complete())
+            .finish()
+    }
+}
+
+// ───────────────────────────────────────────────
+// FutureCtList — async/await style trait for CtList
+// ───────────────────────────────────────────────
+
+/// Extension trait providing `async`/`await`-compatible operations on
+/// [`CtList`](crate::CtList).
+///
+/// Methods return a [`CtListFuture`] that drives Windows OVERLAPPED I/O directly,
+/// without requiring `spawn_blocking` or Tokio.
+///
+/// # Implementations
+///
+/// The trait is implemented for both [`CtList`] (by reference) and
+/// [`Arc<CtList>`](std::sync::Arc) so callers can choose whichever fits their
+/// ownership model.
+///
+/// # Examples
+///
+/// ```no_run
+/// use ctapi_rs::{CtClient, FutureCtList};
+/// use std::sync::Arc;
+///
+/// #[tokio::main]
+/// async fn main() -> anyhow::Result<()> {
+///     let client = Arc::new(CtClient::open(None, None, None, 0)?);
+///     let list = Arc::clone(&client).list_new(0)?;
+///     list.add_tag("Temperature")?;
+///     list.add_tag("Pressure")?;
+///
+///     list.read_future()?.await?;
+///     println!("Temp:  {}", list.read_tag("Temperature", 0)?);
+///     println!("Press: {}", list.read_tag("Pressure", 0)?);
+///     Ok(())
+/// }
+/// ```
+pub trait FutureCtList {
+    /// Read all tags in the list asynchronously and return a [`CtListFuture`]
+    /// that can be `.await`ed.
+    ///
+    /// After this future resolves, call
+    /// [`CtList::read_tag`](crate::CtList::read_tag) to retrieve individual
+    /// values.
+    ///
+    /// # Errors
+    /// Returns `Err` immediately if the operation cannot be started.
+    fn read_future(&self) -> Result<CtListFuture>;
+
+    /// Write a single tag in the list asynchronously and return a
+    /// [`CtListFuture`] that can be `.await`ed.
+    ///
+    /// # Parameters
+    /// * `tag`   - Tag name (must already be added via
+    ///   [`CtList::add_tag`](crate::CtList::add_tag)).
+    /// * `value` - Value string to write.
+    ///
+    /// # Errors
+    /// Returns `Err` immediately if the operation cannot be started.
+    fn write_tag_future(&self, tag: &str, value: &str) -> Result<CtListFuture>;
+}
+
+impl FutureCtList for CtList {
+    fn read_future(&self) -> Result<CtListFuture> {
+        let client = self.client_arc();
+        let mut async_op = Box::new(AsyncOperation::new());
+        self.read_async(&mut async_op)?;
+        Ok(CtListFuture::new(client, async_op))
+    }
+
+    fn write_tag_future(&self, tag: &str, value: &str) -> Result<CtListFuture> {
+        let client = self.client_arc();
+        let mut async_op = Box::new(AsyncOperation::new());
+        self.write_tag_async(tag, value, &mut async_op)?;
+        Ok(CtListFuture::new(client, async_op))
+    }
+}
+
+impl FutureCtList for Arc<CtList> {
+    fn read_future(&self) -> Result<CtListFuture> {
+        let client = self.client_arc();
+        let mut async_op = Box::new(AsyncOperation::new());
+        (**self).read_async(&mut async_op)?;
+        Ok(CtListFuture::new(client, async_op))
+    }
+
+    fn write_tag_future(&self, tag: &str, value: &str) -> Result<CtListFuture> {
+        let client = self.client_arc();
+        let mut async_op = Box::new(AsyncOperation::new());
+        (**self).write_tag_async(tag, value, &mut async_op)?;
+        Ok(CtListFuture::new(client, async_op))
     }
 }
 

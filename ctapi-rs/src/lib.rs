@@ -23,7 +23,9 @@ mod util;
 #[cfg(feature = "tokio-support")]
 pub mod tokio_async;
 
-pub use crate::async_ops::{AsyncCtClient, AsyncOperation, CtApiFuture, FutureCtClient};
+pub use crate::async_ops::{
+    AsyncCtClient, AsyncOperation, CtApiFuture, CtListFuture, FutureCtClient, FutureCtList,
+};
 pub use crate::client::{ct_client_create, ct_client_destroy, CtClient};
 pub use crate::constants::*;
 pub use crate::error::CtApiError;
