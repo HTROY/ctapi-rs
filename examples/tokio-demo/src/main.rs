@@ -27,10 +27,11 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let client = Arc::new(client);  
     // ── Demo 1: Simple async/await calls (spawn_blocking) ──────────────────
     println!("Demo 1: Simple async/await calls (spawn_blocking)");
     println!("--------------------------------------------------");
-    match demo_simple_async(&client).await {
+    match demo_simple_async(&client.clone()).await {
         Ok(_) => println!("✓ Demo 1 completed\n"),
         Err(e) => eprintln!("✗ Demo 1 failed: {}\n", e),
     }
@@ -38,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Demo 2: OVERLAPPED-native Future (no spawn_blocking) ───────────────
     println!("Demo 2: OVERLAPPED-native Future (FutureCtClient)");
     println!("--------------------------------------------------");
-    match demo_future_client(&client).await {
+    match demo_future_client(&client.clone()).await {
         Ok(_) => println!("✓ Demo 2 completed\n"),
         Err(e) => eprintln!("✗ Demo 2 failed: {}\n", e),
     }
@@ -46,7 +47,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Demo 3: Concurrent async operations ────────────────────────────────
     println!("Demo 3: Concurrent async operations");
     println!("------------------------------------");
-    match demo_concurrent_operations(&client).await {
+    match demo_concurrent_operations(&client.clone()).await {
         Ok(_) => println!("✓ Demo 3 completed\n"),
         Err(e) => eprintln!("✗ Demo 3 failed: {}\n", e),
     }
@@ -54,7 +55,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Demo 4: Async tag operations ───────────────────────────────────────
     println!("Demo 4: Async tag read / write");
     println!("------------------------------");
-    match demo_tag_operations(&client).await {
+    match demo_tag_operations(&client.clone()).await {
         Ok(_) => println!("✓ Demo 4 completed\n"),
         Err(e) => eprintln!("✗ Demo 4 failed: {}\n", e),
     }
@@ -62,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Demo 5: Extended tag read (value + quality/timestamp) ──────────────
     println!("Demo 5: Extended tag read (metadata)");
     println!("-------------------------------------");
-    match demo_tag_read_ex(&client).await {
+    match demo_tag_read_ex(&client.clone()).await {
         Ok(_) => println!("✓ Demo 5 completed\n"),
         Err(e) => eprintln!("✗ Demo 5 failed: {}\n", e),
     }
@@ -78,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Demo 7: Spawning multiple Tokio tasks ──────────────────────────────
     println!("Demo 7: Spawning multiple Tokio tasks");
     println!("--------------------------------------");
-    match demo_tokio_tasks(&client).await {
+    match demo_tokio_tasks(&client.clone()).await {
         Ok(_) => println!("✓ Demo 7 completed\n"),
         Err(e) => eprintln!("✗ Demo 7 failed: {}\n", e),
     }
@@ -86,7 +87,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Demo 8: Timeout handling ───────────────────────────────────────────
     println!("Demo 8: Timeout handling");
     println!("------------------------");
-    match demo_timeout_handling(&client).await {
+    match demo_timeout_handling(&client.clone()).await {
         Ok(_) => println!("✓ Demo 8 completed\n"),
         Err(e) => eprintln!("✗ Demo 8 failed: {}\n", e),
     }
@@ -94,7 +95,7 @@ async fn main() -> anyhow::Result<()> {
     // ── Demo 9: Mix FutureCtClient with try_join! ──────────────────────────
     println!("Demo 9: Concurrent OVERLAPPED futures via try_join!");
     println!("----------------------------------------------------");
-    match demo_concurrent_futures(&client).await {
+    match demo_concurrent_futures(&client.clone()).await {
         Ok(_) => println!("✓ Demo 9 completed\n"),
         Err(e) => eprintln!("✗ Demo 9 failed: {}\n", e),
     }

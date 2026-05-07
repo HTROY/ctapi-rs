@@ -416,22 +416,24 @@ impl std::fmt::Debug for AsyncOperation {
 /// }
 /// ```
 pub struct CtApiFuture {
-    /// Owned clone of the CtClient handle.
-    client: CtClient,
+    /// Raw CtAPI handle borrowed from the caller-owned client.
+    client_handle: RawHandle,
     /// Boxed so the OVERLAPPED struct is at a stable heap address.
     /// CtAPI stores a raw `*mut OVERLAPPED` pointer to this struct
     /// during async operations — moving the future must not move the
     /// OVERLAPPED, otherwise CtAPI writes to a dangling pointer.
     async_op: Box<AsyncOperation>,
     state: Option<Arc<FutureState>>,
+    finished: bool,
 }
 
 impl CtApiFuture {
-    pub(crate) fn new(client: &CtClient, async_op: AsyncOperation) -> Self {
+    pub(crate) fn from_boxed(client: &CtClient, async_op: Box<AsyncOperation>) -> Self {
         Self {
-            client: client.clone(),
-            async_op: Box::new(async_op),
+            client_handle: client.handle(),
+            async_op,
             state: None,
+            finished: false,
         }
     }
 }
@@ -449,7 +451,8 @@ impl Future for CtApiFuture {
 
         // Fast path — already done.
         if this.async_op.is_complete() {
-            return Poll::Ready(this.async_op.get_result_with_handle(this.client.handle()));
+            this.finished = true;
+            return Poll::Ready(this.async_op.get_result_with_handle(this.client_handle));
         }
 
         match &this.state {
@@ -511,17 +514,21 @@ impl Future for CtApiFuture {
 
 impl Drop for CtApiFuture {
     fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
         // 1. Tell the waker thread to stop.
         if let Some(state) = &self.state {
             state.cancelled.store(true, Ordering::Relaxed);
         }
         // 2. Cancel the pending I/O to avoid a dangling OVERLAPPED pointer.
         if !self.async_op.is_complete() {
-            // SAFETY: self.client.handle() is a valid CtAPI handle.
+            // SAFETY: self.client_handle is the CtAPI handle used to start this
+            // operation and remains valid as long as the caller keeps CtClient alive.
             // self.async_op.overlapped_mut() returns a pointer to the OVERLAPPED
             // struct owned by this future. They remain valid until drop completes.
             unsafe {
-                let _ = ctCancelIO(self.client.handle(), self.async_op.overlapped_mut());
+                let _ = ctCancelIO(self.client_handle, self.async_op.overlapped_mut());
             }
         }
     }
@@ -702,13 +709,15 @@ pub trait FutureCtClient {
 
 impl FutureCtClient for CtClient {
     fn cicode_future(&self, cmd: &str, vh_win: u32, mode: u32) -> Result<CtApiFuture> {
-        let mut async_op = AsyncOperation::new();
-        self.cicode_async(cmd, vh_win, mode, &mut async_op)?;
-        Ok(CtApiFuture::new(self, async_op))
+        // Keep OVERLAPPED at a stable heap address from start to completion.
+        let mut async_op = Box::new(AsyncOperation::new());
+        self.cicode_async(cmd, vh_win, mode, async_op.as_mut())?;
+        Ok(CtApiFuture::from_boxed(self, async_op))
     }
 
     fn tag_write_future(&self, tag: &str, value: &str) -> Result<CtApiFuture> {
-        let mut async_op = AsyncOperation::new();
+        // Keep OVERLAPPED at a stable heap address from start to completion.
+        let mut async_op = Box::new(AsyncOperation::new());
 
         let tag_cstr = encode_to_gbk_cstring(tag).map_err(|_| CtApiError::InvalidParameter {
             param: "tag".to_string(),
@@ -728,7 +737,7 @@ impl FutureCtClient for CtClient {
                 self.handle(),
                 tag_cstr.as_ptr(),
                 value_cstr.as_ptr(),
-                async_op.overlapped_mut(),
+                async_op.as_mut().overlapped_mut(),
             ) {
                 let err = std::io::Error::last_os_error();
                 // ERROR_IO_PENDING (997) is expected for async operations.
@@ -738,19 +747,21 @@ impl FutureCtClient for CtClient {
             }
         }
 
-        Ok(CtApiFuture::new(self, async_op))
+        Ok(CtApiFuture::from_boxed(self, async_op))
     }
 }
 
 impl FutureCtClient for Arc<CtClient> {
     fn cicode_future(&self, cmd: &str, vh_win: u32, mode: u32) -> Result<CtApiFuture> {
-        let mut async_op = AsyncOperation::new();
-        (**self).cicode_async(cmd, vh_win, mode, &mut async_op)?;
-        Ok(CtApiFuture::new(self, async_op))
+        // Keep OVERLAPPED at a stable heap address from start to completion.
+        let mut async_op = Box::new(AsyncOperation::new());
+        (**self).cicode_async(cmd, vh_win, mode, async_op.as_mut())?;
+        Ok(CtApiFuture::from_boxed(self, async_op))
     }
 
     fn tag_write_future(&self, tag: &str, value: &str) -> Result<CtApiFuture> {
-        let mut async_op = AsyncOperation::new();
+        // Keep OVERLAPPED at a stable heap address from start to completion.
+        let mut async_op = Box::new(AsyncOperation::new());
 
         let tag_cstr = encode_to_gbk_cstring(tag).map_err(|_| CtApiError::InvalidParameter {
             param: "tag".to_string(),
@@ -769,7 +780,7 @@ impl FutureCtClient for Arc<CtClient> {
                 (**self).handle(),
                 tag_cstr.as_ptr(),
                 value_cstr.as_ptr(),
-                async_op.overlapped_mut(),
+                async_op.as_mut().overlapped_mut(),
             ) {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() != Some(997) {
@@ -778,7 +789,7 @@ impl FutureCtClient for Arc<CtClient> {
             }
         }
 
-        Ok(CtApiFuture::new(self, async_op))
+        Ok(CtApiFuture::from_boxed(self, async_op))
     }
 }
 
