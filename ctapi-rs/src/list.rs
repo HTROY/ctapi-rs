@@ -343,7 +343,7 @@ impl CtList {
     /// list.add_tag("Tag1")?;
     ///
     /// let mut async_op = AsyncOperation::new();
-    /// list.write_tag_async("Tag1", "42", &mut async_op)?;
+    /// list.write_tag_async::<&str, &str>("Tag1", "42", &mut async_op)?;
     ///
     /// while !async_op.is_complete() {
     ///     std::thread::sleep(std::time::Duration::from_millis(10));

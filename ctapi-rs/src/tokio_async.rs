@@ -45,7 +45,6 @@
 use crate::error::Result;
 use crate::{AsyncOperation, CtClient, CtList, CtTagValueItems};
 use ctapi_sys::ctGetOverlappedResult;
-use ctapi_sys::ctGetOverlappedResult;
 use std::sync::Arc;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
@@ -321,7 +320,6 @@ impl TokioCtList for CtList {
 
         // Keep the Arc alive so the CtAPI handle stays valid across the blocking thread.
         let client = self.client_arc();
-        let client_handle = client.handle();
 
         tokio::task::spawn_blocking(move || {
             // SAFETY: op owns the WinEvent handle. WaitForSingleObject with
@@ -333,7 +331,12 @@ impl TokioCtList for CtList {
             // already been signalled above.
             unsafe {
                 let mut transferred = 0;
-                if !ctGetOverlappedResult(client_handle, op.overlapped_mut(), &mut transferred, false) {
+                if !ctGetOverlappedResult(
+                    client.handle(),
+                    op.overlapped_mut(),
+                    &mut transferred,
+                    false,
+                ) {
                     return Err(std::io::Error::last_os_error().into());
                 }
             }
@@ -348,20 +351,24 @@ impl TokioCtList for CtList {
 
     async fn write_tag_tokio(&self, tag: &str, value: &str) -> Result<()> {
         let mut op = Box::new(AsyncOperation::new());
-        self.write_tag_async(tag, value, &mut op)
+        self.write_tag_async::<&str, &str>(tag, value, &mut op)
             .map_err(|e| crate::error::CtApiError::Other {
                 code: 0,
                 message: e.to_string(),
             })?;
 
         let client = self.client_arc();
-        let client_handle = client.handle();
 
         tokio::task::spawn_blocking(move || {
             unsafe { WaitForSingleObject(op.win_event_handle(), u32::MAX) };
             unsafe {
                 let mut transferred = 0;
-                if !ctGetOverlappedResult(client_handle, op.overlapped_mut(), &mut transferred, false) {
+                if !ctGetOverlappedResult(
+                    client.handle(),
+                    op.overlapped_mut(),
+                    &mut transferred,
+                    false,
+                ) {
                     return Err(std::io::Error::last_os_error().into());
                 }
             }
@@ -504,4 +511,3 @@ mod tests {
         println!("blocking: {:?}", blocking_result);
     }
 }
-
