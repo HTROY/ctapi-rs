@@ -6,6 +6,7 @@ members = [
   "examples/*"
   ]
 
-#default-members = ["ctapi-rs"]
+default-members = ["ctapi-rs"]
 
 resolver = "2"
+

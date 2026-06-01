@@ -37,6 +37,11 @@ impl Default for OVERLAPPED {
 // SAFETY: All fields are DWORD (u32) or raw pointers to external buffers/handles.
 // The raw pointers are opaque CtAPI identifiers, not references into Rust memory,
 // so there is no aliasing or ownership hazard when the struct is shared across threads.
+//
+// CAUTION: `pData` is a mutable buffer pointer.  Each AsyncOperation owns its own
+// independent buffer via Box<AsyncOperation>, so no two OVERLAPPED instances share
+// the same buffer.  Users MUST NOT clone an OVERLAPPED in a way that duplicates the
+// pData pointer across threads.
 unsafe impl Send for OVERLAPPED {}
 unsafe impl Sync for OVERLAPPED {}
 
@@ -323,3 +328,4 @@ unsafe extern "system" {
     ) -> bool;
 
 }
+

@@ -8,7 +8,7 @@ use encoding_rs::*;
 use std::ffi::{CStr, CString};
 use std::fmt::Display;
 use std::io::Error;
-use std::ops::{Add, Sub};
+// Add, Sub were used by tag_write bounds (removed)
 use std::os::windows::io::RawHandle;
 use std::os::windows::raw::HANDLE;
 use std::sync::Arc;
@@ -306,7 +306,7 @@ impl CtClient {
     pub fn tag_write<T, U>(&self, tag: T, value: U) -> Result<()>
     where
         T: AsRef<str>,
-        U: Display + Add<Output = U> + Sub<Output = U> + Copy + PartialEq,
+        U: Display,
     {
         let tag = encode_to_gbk_cstring(tag.as_ref()).map_err(|_| CtApiError::InvalidParameter {
             param: "tag".to_string(),
@@ -661,3 +661,4 @@ mod tests {
         assert_eq!(result.unwrap(), test_string);
     }
 }
+

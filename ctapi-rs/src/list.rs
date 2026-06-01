@@ -79,7 +79,7 @@ pub struct CtList {
     /// The CtAPI list handle returned by `ctListNew`.
     /// Immutable after construction — no lock required.
     handle: ListHandle,
-    /// Tag name → per-tag handle returned by `ctListAdd`.
+    /// Tag name -> per-tag handle returned by `ctListAdd`.
     ///
     /// `RwLock` instead of `Mutex` because tag reads vastly outnumber
     /// tag additions / removals in typical usage.
@@ -269,7 +269,7 @@ impl CtList {
     ///
     /// Call this function after [`read`] completes for added tags.
     ///
-    /// Acquires a **shared read lock** on the tag map — multiple threads may
+    /// Acquires a **shared read lock** on the tag map, multiple threads may
     /// call `read_tag` concurrently without blocking each other.
     pub fn read_tag<T: AsRef<str>>(&self, tag: T, mode: u32) -> Result<String> {
         let tag_map = self.tag_map.read().expect("CtList tag_map RwLock poisoned");
@@ -300,9 +300,9 @@ impl CtList {
 
     /// Write single tag in list
     ///
-    /// Acquires a **shared read lock** on the tag map — multiple threads may
+    /// Acquires a **shared read lock** on the tag map, multiple threads may
     /// call `write_tag` concurrently without blocking each other.
-    pub fn write_tag<T: AsRef<str>>(&self, tag: T, value: T) -> Result<()> {
+    pub fn write_tag<T: AsRef<str>, U: AsRef<str>>(&self, tag: T, value: U) -> Result<()> {
         let tag_map = self.tag_map.read().expect("CtList tag_map RwLock poisoned");
         if let Some(handle) = tag_map.get(tag.as_ref()) {
             let cvalue = CString::new(GBK.encode(value.as_ref()).0)?;
@@ -326,7 +326,7 @@ impl CtList {
     /// Non-blocking version of [`write_tag`].  The write completes in the
     /// background.
     ///
-    /// Acquires a **shared read lock** on the tag map — multiple threads may
+    /// Acquires a **shared read lock** on the tag map, multiple threads may
     /// call `write_tag_async` concurrently without blocking each other.
     ///
     /// # Parameters
@@ -350,7 +350,7 @@ impl CtList {
     /// }
     /// # Ok::<(), anyhow::Error>(())
     /// ```
-    pub fn write_tag_async<T: AsRef<str>>(
+    pub fn write_tag_async<T: AsRef<str>, U: AsRef<str>>(
         &self,
         tag: T,
         value: T,
@@ -382,7 +382,7 @@ impl Drop for CtList {
     fn drop(&mut self) {
         if !self.handle.0.is_null() {
             // Safety: the handle was created by ctListNew and is valid.
-            // `handle` is a plain field — no lock needed in Drop.
+            // `handle` is a plain field, no lock needed in Drop.
             // Arc guarantees Drop runs only after all clones are gone,
             // so no other thread can be using the handle concurrently.
             unsafe { ctListFree(self.handle.0) };
@@ -401,3 +401,6 @@ mod tests {
         assert_sync::<super::CtList>();
     }
 }
+
+
+

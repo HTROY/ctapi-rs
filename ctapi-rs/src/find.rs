@@ -1,5 +1,6 @@
 //! Object search related implementation
 use crate::error::Result;
+use crate::util::encode_to_gbk_cstring;
 use ctapi_sys::*;
 use encoding_rs::*;
 use std::ffi::{CString, c_void};
@@ -132,7 +133,7 @@ impl FindObject {
     pub fn get_property<T: AsRef<str>>(&self, name: T) -> Result<String> {
         let mut buffer = [0u8; 256];
         let mut len: u32 = 0;
-        let name = CString::new(GBK.encode(name.as_ref()).0)?;
+        let name = encode_to_gbk_cstring(name.as_ref())?;
         // SAFETY: self.0 is a valid FindObject handle from ctFindFirst/ctFindNext.
         // name is a GBK-encoded CString. buffer is a fixed-size stack array.
         // len is a local stack variable.
@@ -196,3 +197,4 @@ mod tests {
         assert_eq!(1 + 1, 2); // Placeholder test
     }
 }
+

@@ -44,12 +44,14 @@
 
 use crate::error::Result;
 use crate::{AsyncOperation, CtClient, CtList, CtTagValueItems};
+use ctapi_sys::ctGetOverlappedResult;
+use ctapi_sys::ctGetOverlappedResult;
 use std::sync::Arc;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
-// ───────────────────────────────────────────────
+// ----------------------------------------------------------------------------------------------
 // TokioCtClient
-// ───────────────────────────────────────────────
+// ----------------------------------------------------------------------------------------------
 
 /// Extension trait providing `async`/`await`-compatible methods for
 /// [`CtClient`].
@@ -74,7 +76,7 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 /// async fn main() -> anyhow::Result<()> {
 ///     let client = Arc::new(CtClient::open(None, None, None, 0)?);
 ///
-///     // Concurrent reads — spawn multiple Tokio tasks
+///     // Concurrent reads --?spawn multiple Tokio tasks
 ///     let c1 = Arc::clone(&client);
 ///     let c2 = Arc::clone(&client);
 ///     let (v1, v2) = tokio::try_join!(
@@ -168,7 +170,7 @@ pub trait TokioCtClient {
     async fn tag_write_tokio(&self, tag: &str, value: &str) -> Result<()>;
 }
 
-// ── impl for CtClient ────────────────────────────────────────────────────────
+// ---- impl for CtClient ----------------------------------------------------------------------------------------------------------------
 
 impl TokioCtClient for CtClient {
     async fn cicode_tokio(&self, cmd: &str, vh_win: u32, mode: u32) -> Result<String> {
@@ -202,7 +204,7 @@ impl TokioCtClient for CtClient {
     }
 }
 
-// ── impl for Arc<CtClient> ───────────────────────────────────────────────────
+// ---- impl for Arc<CtClient> ------------------------------------------------------------------------------------------------------
 
 impl TokioCtClient for Arc<CtClient> {
     async fn cicode_tokio(&self, cmd: &str, vh_win: u32, mode: u32) -> Result<String> {
@@ -236,9 +238,9 @@ impl TokioCtClient for Arc<CtClient> {
     }
 }
 
-// ───────────────────────────────────────────────
+// ----------------------------------------------------------------------------------------------
 // TokioCtList
-// ───────────────────────────────────────────────
+// ----------------------------------------------------------------------------------------------
 
 /// Extension trait providing `async`/`await`-compatible methods for
 /// [`CtList`].
@@ -317,16 +319,31 @@ impl TokioCtList for CtList {
                 message: e.to_string(),
             })?;
 
+        // Keep the Arc alive so the CtAPI handle stays valid across the blocking thread.
+        let client = self.client_arc();
+        let client_handle = client.handle();
+
         tokio::task::spawn_blocking(move || {
             // SAFETY: op owns the WinEvent handle. WaitForSingleObject with
             // INFINITE blocks until the OVERLAPPED operation signals the event.
             unsafe { WaitForSingleObject(op.win_event_handle(), u32::MAX) };
+            // SAFETY: client_handle is valid (kept alive by `client` Arc).
+            // op.overlapped_mut() is a stable heap pointer.  We call
+            // ctGetOverlappedResult with bWait=false because the event has
+            // already been signalled above.
+            unsafe {
+                let mut transferred = 0;
+                if !ctGetOverlappedResult(client_handle, op.overlapped_mut(), &mut transferred, false) {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+            Ok(())
         })
         .await
         .map_err(|e| crate::error::CtApiError::Other {
             code: 0,
             message: e.to_string(),
-        })
+        })?
     }
 
     async fn write_tag_tokio(&self, tag: &str, value: &str) -> Result<()> {
@@ -337,14 +354,24 @@ impl TokioCtList for CtList {
                 message: e.to_string(),
             })?;
 
+        let client = self.client_arc();
+        let client_handle = client.handle();
+
         tokio::task::spawn_blocking(move || {
             unsafe { WaitForSingleObject(op.win_event_handle(), u32::MAX) };
+            unsafe {
+                let mut transferred = 0;
+                if !ctGetOverlappedResult(client_handle, op.overlapped_mut(), &mut transferred, false) {
+                    return Err(std::io::Error::last_os_error().into());
+                }
+            }
+            Ok(())
         })
         .await
         .map_err(|e| crate::error::CtApiError::Other {
             code: 0,
             message: e.to_string(),
-        })
+        })?
     }
 }
 
@@ -380,9 +407,9 @@ impl TokioCtList for Arc<CtList> {
     }
 }
 
-// ───────────────────────────────────────────────
+// ----------------------------------------------------------------------------------------------
 // Helpers
-// ───────────────────────────────────────────────
+// ----------------------------------------------------------------------------------------------
 
 /// Run `f` on Tokio's blocking thread pool and map a `JoinError` into
 /// [`CtApiError::Other`].
@@ -399,9 +426,9 @@ where
         })?
 }
 
-// ───────────────────────────────────────────────
+// ----------------------------------------------------------------------------------------------
 // Tests
-// ───────────────────────────────────────────────
+// ----------------------------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -469,7 +496,7 @@ mod tests {
         let client =
             CtClient::open(Some("127.0.0.1"), Some("Engineer"), Some("Citect"), 0).unwrap();
 
-        // FutureCtClient uses OVERLAPPED — compare result with spawn_blocking approach.
+        // FutureCtClient uses OVERLAPPED --?compare result with spawn_blocking approach.
         let future_result = client.cicode_future("Time(1)", 0, 0).unwrap().await;
         let blocking_result = client.cicode_tokio("Time(1)", 0, 0).await;
 
@@ -477,3 +504,4 @@ mod tests {
         println!("blocking: {:?}", blocking_result);
     }
 }
+

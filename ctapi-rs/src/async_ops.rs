@@ -998,7 +998,7 @@ impl FutureCtList for CtList {
     fn write_tag_future(&self, tag: &str, value: &str) -> Result<CtListFuture> {
         let client = self.client_arc();
         let mut async_op = Box::new(AsyncOperation::new());
-        self.write_tag_async(tag, value, &mut async_op)?;
+        self.write_tag_async::<&str, &str>(tag, value, &mut async_op)?;
         Ok(CtListFuture::new(client, async_op))
     }
 }
@@ -1014,7 +1014,7 @@ impl FutureCtList for Arc<CtList> {
     fn write_tag_future(&self, tag: &str, value: &str) -> Result<CtListFuture> {
         let client = self.client_arc();
         let mut async_op = Box::new(AsyncOperation::new());
-        (**self).write_tag_async(tag, value, &mut async_op)?;
+        (**self).write_tag_async::<&str, &str>(tag, value, &mut async_op)?;
         Ok(CtListFuture::new(client, async_op))
     }
 }
