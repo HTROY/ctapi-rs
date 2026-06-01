@@ -1,4 +1,4 @@
-//! Tag list operation related implementation
+﻿//! Tag list operation related implementation
 use super::CtClient;
 use crate::error::{CtApiError, Result};
 use ctapi_sys::*;
@@ -40,13 +40,13 @@ unsafe impl Sync for ListHandle {}
 ///
 /// As a result:
 /// - `read()` / `read_async()` are **completely lock-free**.
-/// - `read_tag()` / `write_tag()` acquire a **shared read lock** — multiple
+/// - `read_tag()` / `write_tag()` acquire a **shared read lock** multiple
 ///   threads can call them simultaneously.
-/// - `add_tag()` / `delete_tag()` acquire an **exclusive write lock** — they
+/// - `add_tag()` / `delete_tag()` acquire an **exclusive write lock** they
 ///   serialize against each other and against concurrent readers, but these
 ///   operations are rare in practice.
 ///
-/// ## Concurrent usage — TOCTOU awareness
+/// ## Concurrent usage TOCTOU awareness
 ///
 /// Between a `read()` call returning and a subsequent `read_tag()` call,
 /// another thread may add or delete tags. This means `read_tag()` can
@@ -77,7 +77,7 @@ unsafe impl Sync for ListHandle {}
 pub struct CtList {
     client: Arc<CtClient>,
     /// The CtAPI list handle returned by `ctListNew`.
-    /// Immutable after construction — no lock required.
+    /// Immutable after construction no lock required.
     handle: ListHandle,
     /// Tag name -> per-tag handle returned by `ctListAdd`.
     ///
@@ -353,7 +353,7 @@ impl CtList {
     pub fn write_tag_async<T: AsRef<str>, U: AsRef<str>>(
         &self,
         tag: T,
-        value: T,
+        value: U,
         async_op: &mut crate::AsyncOperation,
     ) -> Result<()> {
         let tag_map = self.tag_map.read().expect("CtList tag_map RwLock poisoned");

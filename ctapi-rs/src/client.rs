@@ -259,7 +259,7 @@ impl CtClient {
                 self.handle,
                 tag.as_ptr(),
                 buffer.as_mut_ptr(),
-                256,
+                buffer.len() as DWORD,
                 tagvalue_items,
             ) {
                 return Err(std::io::Error::last_os_error().into());
@@ -414,7 +414,7 @@ impl CtClient {
         // CString. buffer is a fixed-size stack array. NULL OVERLAPPED pointer
         // means synchronous execution.
         unsafe {
-            if !ctCicode(
+            if ctCicode(
                 self.handle,
                 cmd.as_ptr(),
                 vh_win,
@@ -422,7 +422,7 @@ impl CtClient {
                 buffer.as_mut_ptr(),
                 buffer.len() as DWORD,
                 NULL as *mut OVERLAPPED,
-            ) {
+            ) == 0 {
                 return Err(std::io::Error::last_os_error().into());
             }
 
@@ -661,4 +661,5 @@ mod tests {
         assert_eq!(result.unwrap(), test_string);
     }
 }
+
 

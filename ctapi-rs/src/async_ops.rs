@@ -18,7 +18,7 @@
 //! async fn run() -> anyhow::Result<()> {
 //!     let client = CtClient::open(None, None, None, 0)?;
 //!
-//!     // Await directly — no tokio::spawn_blocking needed
+//!     // Await directly no tokio::spawn_blocking needed
 //!     let result = client.cicode_future("Time(1)", 0, 0)?.await?;
 //!     println!("Time: {}", result);
 //!     Ok(())
@@ -45,12 +45,7 @@ use windows_sys::Win32::System::Threading::WaitForSingleObject;
 /// `WaitForSingleObject` return value: timeout elapsed without the object being signalled.
 const WAIT_TIMEOUT: u32 = 0x0000_0102;
 
-// ───────────────────────────────────────────────
-// WinEvent — Arc-wrapped Windows event handle
-// ───────────────────────────────────────────────
-
 /// An owned Windows event handle that can be safely shared across threads via [`Arc`].
-///
 /// The event is automatically closed (via `CloseHandle`) when the last `Arc` reference
 /// is dropped, ensuring the handle stays valid as long as any thread still needs it.
 struct WinEvent(HANDLE);
@@ -87,18 +82,11 @@ impl Drop for WinEvent {
 unsafe impl Send for WinEvent {}
 unsafe impl Sync for WinEvent {}
 
-// ───────────────────────────────────────────────
-// FutureState — shared between CtApiFuture and the waker thread
-// ───────────────────────────────────────────────
-
+/// FutureState shared between CtApiFuture and the waker thread
 struct FutureState {
     waker: Mutex<Option<Waker>>,
     cancelled: AtomicBool,
 }
-
-// ───────────────────────────────────────────────
-// AsyncOperation
-// ───────────────────────────────────────────────
 
 /// Represents an asynchronous operation handle.
 ///
@@ -131,7 +119,7 @@ struct FutureState {
 pub struct AsyncOperation {
     overlapped: OVERLAPPED,
     buffer: Vec<u8>,
-    /// Ref-counted event handle — shared with [`CtApiFuture`]'s waker thread so
+    /// Ref-counted event handle shared with [`CtApiFuture`]'s waker thread so
     /// that the kernel object is not closed while a thread is waiting on it.
     win_event: Arc<WinEvent>,
 }
@@ -267,7 +255,7 @@ impl AsyncOperation {
             } else {
                 let err = std::io::Error::last_os_error();
                 if err.raw_os_error() == Some(997) {
-                    // ERROR_IO_INCOMPLETE — still pending
+                    // ERROR_IO_INCOMPLETE still pending
                     None
                 } else {
                     Some(Err(err.into()))
@@ -315,10 +303,6 @@ impl AsyncOperation {
         self.buffer.fill(0);
     }
 
-    // ── internal ────────────────────────────────────────────────────────────
-
-    /// Common implementation used by both [`get_result`] and [`CtApiFuture`].
-    ///
     /// When `wait = false` the caller must ensure the operation has already
     /// completed (i.e. [`is_complete`] returned `true`).
     fn get_result_impl(&mut self, client_handle: RawHandle, wait: bool) -> Result<String> {
@@ -335,7 +319,7 @@ impl AsyncOperation {
             ) {
                 return Err(std::io::Error::last_os_error().into());
             }
-            // Operations like tag writes may transfer 0 bytes — return empty string.
+            // Operations like tag writes may transfer 0 bytes return empty string.
             if bytes_transferred == 0 {
                 return Ok(String::new());
             }
@@ -347,7 +331,7 @@ impl AsyncOperation {
         }
     }
 
-    /// Non-blocking result extraction — used by [`CtApiFuture`] after the
+    /// Non-blocking result extraction used by [`CtApiFuture`] after the
     /// operation is known to have completed.
     pub(crate) fn get_result_with_handle(&mut self, client_handle: RawHandle) -> Result<String> {
         self.get_result_impl(client_handle, false)
@@ -377,14 +361,8 @@ impl std::fmt::Debug for AsyncOperation {
     }
 }
 
-// ───────────────────────────────────────────────
-// CtApiFuture — std::future::Future over OVERLAPPED
-// ───────────────────────────────────────────────
-
-/// A [`Future`] that wraps an in-progress CtAPI OVERLAPPED async operation.
-///
 /// Created by [`FutureCtClient`] methods. Supports `.await` in any async context
-/// without requiring Tokio — a lightweight background thread waits on the
+/// without requiring Tokio    a lightweight background thread waits on the
 /// Windows event handle and wakes the task when the operation completes.
 ///
 /// # Cancellation
@@ -395,7 +373,7 @@ impl std::fmt::Debug for AsyncOperation {
 ///
 /// # Thread Safety
 ///
-/// `CtApiFuture` implements [`Send`] — it can be spawned in Tokio tasks or any
+/// `CtApiFuture` implements [`Send`]    it can be spawned in Tokio tasks or any
 /// other multi-threaded async runtime.  The internal waker thread only accesses
 /// the Windows event handle (a kernel identifier), never the result buffer or
 /// the client handle directly.
@@ -409,7 +387,7 @@ impl std::fmt::Debug for AsyncOperation {
 /// async fn main() -> anyhow::Result<()> {
 ///     let client = CtClient::open(None, None, None, 0)?;
 ///
-///     // Uses OVERLAPPED internally — no spawn_blocking needed
+///     // Uses OVERLAPPED internally    no spawn_blocking needed
 ///     let time  = client.cicode_future("Time(1)", 0, 0)?.await?;
 ///     let date  = client.cicode_future("Date(4)", 0, 0)?.await?;
 ///     println!("{} {}", time, date);
@@ -423,7 +401,7 @@ pub struct CtApiFuture {
     client: Arc<CtClient>,
     /// Boxed so the OVERLAPPED struct is at a stable heap address.
     /// CtAPI stores a raw `*mut OVERLAPPED` pointer to this struct
-    /// during async operations — moving the future must not move the
+    /// during async operations    moving the future must not move the
     /// OVERLAPPED, otherwise CtAPI writes to a dangling pointer.
     async_op: Box<AsyncOperation>,
     state: Option<Arc<FutureState>>,
@@ -455,7 +433,7 @@ impl Future for CtApiFuture {
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
 
-        // Fast path — already done.
+        // Fast path already done.
         if this.async_op.is_complete() {
             this.finished = true;
             return Poll::Ready(this.async_op.get_result_with_handle(this.client.handle()));
@@ -493,7 +471,7 @@ impl Future for CtApiFuture {
                         }
 
                         if status != WAIT_TIMEOUT {
-                            // Operation finished (or handle error) — wake the task.
+                            // Operation finished (or handle error) wake the task.
                             if let Ok(mut lock) = thread_state.waker.lock()
                                 && let Some(waker) = lock.take()
                             {
@@ -501,7 +479,7 @@ impl Future for CtApiFuture {
                             }
                             return;
                         }
-                        // WAIT_TIMEOUT — loop and try again.
+                        // WAIT_TIMEOUT loop and try again.
                     }
                 })
                 .expect("failed to spawn ctapi-waker thread");
@@ -546,10 +524,6 @@ impl std::fmt::Debug for CtApiFuture {
             .finish()
     }
 }
-
-// ───────────────────────────────────────────────
-// AsyncCtClient — callback-style async trait
-// ───────────────────────────────────────────────
 
 /// Extension trait providing callback-style (OVERLAPPED) async operations on
 /// [`CtClient`].
@@ -609,7 +583,7 @@ impl AsyncCtClient for CtClient {
         // async_op.overlapped_mut() returns a pointer to the OVERLAPPED struct
         // that will track the async completion.
         unsafe {
-            if !ctCicode(
+            if ctCicode(
                 self.handle(),
                 cmd.as_ptr(),
                 vh_win,
@@ -617,7 +591,7 @@ impl AsyncCtClient for CtClient {
                 async_op.buffer.as_mut_ptr() as *mut i8,
                 async_op.buffer.len() as u32,
                 async_op.overlapped_mut(),
-            ) {
+            ) == 0 {
                 let err = std::io::Error::last_os_error();
                 // ERROR_IO_PENDING (997) is expected for async operations.
                 if err.raw_os_error() != Some(997) {
@@ -628,10 +602,6 @@ impl AsyncCtClient for CtClient {
         }
     }
 }
-
-// ───────────────────────────────────────────────
-// FutureCtClient — async/await style trait
-// ───────────────────────────────────────────────
 
 /// Extension trait providing `async`/`await`-compatible operations on
 /// [`CtClient`].
@@ -760,7 +730,7 @@ impl FutureCtClient for CtClient {
 
 impl FutureCtClient for Arc<CtClient> {
     fn cicode_future(&self, cmd: &str, vh_win: u32, mode: u32) -> Result<CtApiFuture> {
-        // self is &Arc<CtClient> — the future stores a clone of this Arc.
+        // self is &Arc<CtClient> the future stores a clone of this Arc.
         let mut async_op = Box::new(AsyncOperation::new());
         (**self).cicode_async(cmd, vh_win, mode, async_op.as_mut())?;
         Ok(CtApiFuture::from_boxed(self, async_op))
@@ -799,14 +769,10 @@ impl FutureCtClient for Arc<CtClient> {
     }
 }
 
-// ───────────────────────────────────────────────
-// CtListFuture — std::future::Future over OVERLAPPED for CtList operations
-// ───────────────────────────────────────────────
-
 /// A [`Future`] that wraps an in-progress CtAPI OVERLAPPED async list operation.
 ///
 /// Created by [`FutureCtList`] methods. Supports `.await` in any async context
-/// without requiring Tokio — a lightweight background thread waits on the
+/// without requiring Tokio    a lightweight background thread waits on the
 /// Windows event handle and wakes the task when the operation completes.
 ///
 /// # Cancellation
@@ -817,7 +783,7 @@ impl FutureCtClient for Arc<CtClient> {
 ///
 /// # Thread Safety
 ///
-/// `CtListFuture` implements [`Send`] — it can be spawned in Tokio tasks or any
+/// `CtListFuture` implements [`Send`] it can be spawned in Tokio tasks or any
 /// other multi-threaded async runtime.
 pub struct CtListFuture {
     /// Keeps the CtAPI connection alive for the lifetime of this future.
@@ -927,10 +893,6 @@ impl std::fmt::Debug for CtListFuture {
     }
 }
 
-// ───────────────────────────────────────────────
-// FutureCtList — async/await style trait for CtList
-// ───────────────────────────────────────────────
-
 /// Extension trait providing `async`/`await`-compatible operations on
 /// [`CtList`](crate::CtList).
 ///
@@ -1019,10 +981,6 @@ impl FutureCtList for Arc<CtList> {
     }
 }
 
-// ───────────────────────────────────────────────
-// Tests
-// ───────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,7 +1026,7 @@ mod tests {
     #[test]
     fn test_win_event_arc_sharing() {
         let op = AsyncOperation::new();
-        // Clone the Arc — both references should point to the same handle.
+        // Clone the Arc both references should point to the same handle.
         let shared = Arc::clone(&op.win_event);
         assert_eq!(op.win_event.handle(), shared.handle());
     }

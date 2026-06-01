@@ -221,7 +221,7 @@ unsafe extern "system" {
         sResult: LPSTR,
         dwLength: DWORD,
         pctOverlapped: *mut OVERLAPPED,
-    ) -> bool;
+    ) -> DWORD;
     pub fn ctClientCreate() -> HANDLE;
     pub fn ctClientDestroy(hCTAPI: HANDLE) -> bool;
     pub fn ctClose(hCTAPI: HANDLE) -> bool;

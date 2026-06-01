@@ -149,7 +149,7 @@ impl FindObject {
                 return Err(std::io::Error::last_os_error().into());
             }
             Ok(GBK
-                .decode(std::slice::from_raw_parts(buffer.as_ptr(), len as usize))
+                .decode(std::slice::from_raw_parts(buffer.as_ptr(), (len.min(256)) as usize))
                 .0
                 .to_string())
         }

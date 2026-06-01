@@ -1,4 +1,4 @@
-//! Tokio async runtime integration
+﻿//! Tokio async runtime integration
 //!
 //! This module provides integration with the Tokio async runtime, allowing
 //! CtAPI operations to be used with Rust's `async`/`await` syntax via
@@ -19,7 +19,7 @@
 //! `spawn_blocking`, leaving the async runtime free to drive other tasks.
 //!
 //! For operations that natively support Windows OVERLAPPED I/O (e.g. Cicode),
-//! consider [`FutureCtClient`](crate::FutureCtClient) instead — it avoids a
+//! consider [`FutureCtClient`](crate::FutureCtClient) instead it avoids a
 //! dedicated thread entirely.
 //!
 //! # Examples
@@ -249,10 +249,10 @@ impl TokioCtClient for Arc<CtClient> {
 /// [`CtList`] is `Send + Sync` and can be safely shared across threads via
 /// `Arc<CtList>`.  Two implementations are provided:
 ///
-/// - **`impl TokioCtList for CtList`** — uses Windows OVERLAPPED I/O with
+/// - **`impl TokioCtList for CtList`** uses Windows OVERLAPPED I/O with
 ///   polling; best for single-task usage where the list is owned by one async
 ///   context.
-/// - **`impl TokioCtList for Arc<CtList>`** — offloads the blocking call to
+/// - **`impl TokioCtList for Arc<CtList>`** offloads the blocking call to
 ///   Tokio's blocking-thread pool via [`tokio::task::spawn_blocking`]; best
 ///   when the same list is shared across multiple Tokio tasks.
 ///
@@ -303,20 +303,17 @@ pub trait TokioCtList {
 ///
 /// Uses Windows OVERLAPPED I/O with event-driven wake via the OVERLAPPED
 /// event handle. A single Tokio blocking thread waits on the event and
-/// returns as soon as the operation completes — no polling latency.
+/// returns as soon as the operation completes no polling latency.
 /// Suitable for single-task contexts.
 impl TokioCtList for CtList {
     async fn read_tokio(&self) -> Result<()> {
         // Box the AsyncOperation before starting so the OVERLAPPED struct
         // lives at a stable heap address. CtAPI stores a raw pointer to it
-        // and writes completion data there — moving `op` after read_async
+        // and writes completion data there moving `op` after read_async
         // would leave CtAPI with a dangling pointer.
         let mut op = Box::new(AsyncOperation::new());
         self.read_async(&mut op)
-            .map_err(|e| crate::error::CtApiError::Other {
-                code: 0,
-                message: e.to_string(),
-            })?;
+            .map_err(|e| crate::error::CtApiError::System(e))?;
 
         // Keep the Arc alive so the CtAPI handle stays valid across the blocking thread.
         let client = self.client_arc();
@@ -343,19 +340,13 @@ impl TokioCtList for CtList {
             Ok(())
         })
         .await
-        .map_err(|e| crate::error::CtApiError::Other {
-            code: 0,
-            message: e.to_string(),
-        })?
+        .map_err(|e| crate::error::CtApiError::System(e))?
     }
 
     async fn write_tag_tokio(&self, tag: &str, value: &str) -> Result<()> {
         let mut op = Box::new(AsyncOperation::new());
         self.write_tag_async::<&str, &str>(tag, value, &mut op)
-            .map_err(|e| crate::error::CtApiError::Other {
-                code: 0,
-                message: e.to_string(),
-            })?;
+            .map_err(|e| crate::error::CtApiError::System(e))?;
 
         let client = self.client_arc();
 
@@ -375,10 +366,7 @@ impl TokioCtList for CtList {
             Ok(())
         })
         .await
-        .map_err(|e| crate::error::CtApiError::Other {
-            code: 0,
-            message: e.to_string(),
-        })?
+        .map_err(|e| crate::error::CtApiError::System(e))?
     }
 }
 
@@ -391,10 +379,7 @@ impl TokioCtList for Arc<CtList> {
     async fn read_tokio(&self) -> Result<()> {
         let list = Arc::clone(self);
         spawn_blocking_result(move || {
-            list.read().map_err(|e| crate::error::CtApiError::Other {
-                code: 0,
-                message: e.to_string(),
-            })
+            list.read().map_err(|e| crate::error::CtApiError::System(e))
         })
         .await
     }
@@ -414,10 +399,6 @@ impl TokioCtList for Arc<CtList> {
     }
 }
 
-// ----------------------------------------------------------------------------------------------
-// Helpers
-// ----------------------------------------------------------------------------------------------
-
 /// Run `f` on Tokio's blocking thread pool and map a `JoinError` into
 /// [`CtApiError::Other`].
 async fn spawn_blocking_result<F, T>(f: F) -> Result<T>
@@ -427,15 +408,8 @@ where
 {
     tokio::task::spawn_blocking(f)
         .await
-        .map_err(|e| crate::error::CtApiError::Other {
-            code: 0,
-            message: e.to_string(),
-        })?
+        .map_err(|e| crate::error::CtApiError::System(e))?
 }
-
-// ----------------------------------------------------------------------------------------------
-// Tests
-// ----------------------------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -511,3 +485,4 @@ mod tests {
         println!("blocking: {:?}", blocking_result);
     }
 }
+
