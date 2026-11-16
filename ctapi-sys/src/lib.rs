@@ -5,6 +5,8 @@ pub type LPCSTR = *const c_char;
 pub type LPSTR = *mut c_char;
 pub type DWORD = u32;
 pub type BYTE = u8;
+/// Win32 BOOL used by CtAPI function signatures.
+pub type BOOL = i32;
 
 /// CtAPI OVERLAPPED structure for asynchronous operations
 /// This is different from Windows' standard OVERLAPPED structure
@@ -34,14 +36,9 @@ impl Default for OVERLAPPED {
     }
 }
 
-// SAFETY: All fields are DWORD (u32) or raw pointers to external buffers/handles.
-// The raw pointers are opaque CtAPI identifiers, not references into Rust memory,
-// so there is no aliasing or ownership hazard when the struct is shared across threads.
-//
-// CAUTION: `pData` is a mutable buffer pointer.  Each AsyncOperation owns its own
-// independent buffer via Box<AsyncOperation>, so no two OVERLAPPED instances share
-// the same buffer.  Users MUST NOT clone an OVERLAPPED in a way that duplicates the
-// pData pointer across threads.
+// SAFETY: This structure stores integer and raw pointer values. Dereferencing
+// the pointers or sharing the structure with in-flight I/O requires the caller
+// to uphold the native buffer lifetime and synchronization contracts.
 unsafe impl Send for OVERLAPPED {}
 unsafe impl Sync for OVERLAPPED {}
 
@@ -57,8 +54,8 @@ pub struct CtTagValueItems {
     pub quality_limit: u8,
     pub quality_extended_substatus: u8,
     pub quality_datasource_error: u32,
-    pub boverride: bool,
-    pub control_mode: bool,
+    pub boverride: BYTE,
+    pub control_mode: BYTE,
 }
 
 impl CtTagValueItems {
@@ -71,7 +68,7 @@ impl CtTagValueItems {
 impl Default for CtTagValueItems {
     fn default() -> Self {
         Self {
-            length: 38,
+            length: std::mem::size_of::<Self>() as u32,
             timestamp: 0,
             value_timestamp: 0,
             quality_timestamp: 0,
@@ -80,8 +77,8 @@ impl Default for CtTagValueItems {
             quality_limit: 0,
             quality_extended_substatus: 0,
             quality_datasource_error: 0,
-            boverride: false,
-            control_mode: false,
+            boverride: 0,
+            control_mode: 0,
         }
     }
 }
@@ -208,11 +205,16 @@ pub enum DBTYPEENUM {
 }
 
 #[cfg(target_os = "windows")]
-#[link(name = "CtApi", kind = "raw-dylib")]
+// The x86 DLL exports undecorated names with the system calling convention.
+#[cfg_attr(
+    target_arch = "x86",
+    link(name = "CtApi", kind = "raw-dylib", import_name_type = "undecorated")
+)]
+#[cfg_attr(not(target_arch = "x86"), link(name = "CtApi", kind = "raw-dylib"))]
 #[allow(non_snake_case)]
 unsafe extern "system" {
     ///FFI API function
-    pub fn ctCancelIO(hCTAPI: HANDLE, pctOverlapped: *mut OVERLAPPED) -> bool;
+    pub fn ctCancelIO(hCTAPI: HANDLE, pctOverlapped: *mut OVERLAPPED) -> BOOL;
     pub fn ctCicode(
         hCTAPI: HANDLE,
         sCmd: LPCSTR,
@@ -223,16 +225,16 @@ unsafe extern "system" {
         pctOverlapped: *mut OVERLAPPED,
     ) -> DWORD;
     pub fn ctClientCreate() -> HANDLE;
-    pub fn ctClientDestroy(hCTAPI: HANDLE) -> bool;
-    pub fn ctClose(hCTAPI: HANDLE) -> bool;
-    pub fn ctCloseEx(hCTAPI: HANDLE, bDestroy: bool) -> bool;
+    pub fn ctClientDestroy(hCTAPI: HANDLE) -> BOOL;
+    pub fn ctClose(hCTAPI: HANDLE) -> BOOL;
+    pub fn ctCloseEx(hCTAPI: HANDLE, bDestroy: BOOL) -> BOOL;
     pub fn ctEngToRaw(
         pResult: *mut f64,
         dValue: f64,
         pScale: *const CtScale,
         dwMode: DWORD,
-    ) -> bool;
-    pub fn ctFindClose(hnd: HANDLE) -> bool;
+    ) -> BOOL;
+    pub fn ctFindClose(hnd: HANDLE) -> BOOL;
     pub fn ctFindFirst(
         hCTAPI: HANDLE,
         szTableName: LPCSTR,
@@ -248,47 +250,47 @@ unsafe extern "system" {
         pObjHnd: *mut HANDLE,
         dwFlags: DWORD,
     ) -> HANDLE;
-    pub fn ctFindNext(hnd: HANDLE, pObjHnd: *mut HANDLE) -> bool;
+    pub fn ctFindNext(hnd: HANDLE, pObjHnd: *mut HANDLE) -> BOOL;
     pub fn ctFindNumRecords(hnd: HANDLE) -> i32;
-    pub fn ctFindPrev(hnd: HANDLE, pObjHnd: *mut HANDLE) -> bool;
+    pub fn ctFindPrev(hnd: HANDLE, pObjHnd: *mut HANDLE) -> BOOL;
     pub fn ctFindScroll(hnd: HANDLE, dwMode: DWORD, dwOffset: i32, pObjHnd: *mut HANDLE) -> DWORD;
     pub fn ctGetOverlappedResult(
         hCTAPI: HANDLE,
         lpctOverlapped: *mut OVERLAPPED,
         pBytes: *mut DWORD,
-        bWait: bool,
-    ) -> bool;
+        bWait: BOOL,
+    ) -> BOOL;
     pub fn ctGetProperty(
         hnd: HANDLE,
         szName: LPCSTR,
         pData: *mut c_void,
         dwBufferLength: DWORD,
         dwResultLength: *mut DWORD,
-        dwType: DBTYPEENUM,
-    ) -> bool;
-    //fn ctHasOverlappedIsCompleted(lpctOverlapped: *mut CtOverlapped) -> bool;
+        dwType: DWORD,
+    ) -> BOOL;
+    //fn ctHasOverlappedIsCompleted(lpctOverlapped: *mut CtOverlapped) -> BOOL;
     pub fn ctListAdd(hCTAPI: HANDLE, sTag: LPCSTR) -> HANDLE;
     pub fn ctListAddEx(
         hList: HANDLE,
         sTag: LPCSTR,
-        bRaw: bool,
+        bRaw: BOOL,
         nPollPerodMS: i32,
         dDeadban: f64,
     ) -> HANDLE;
-    pub fn ctListData(hTag: HANDLE, pBuffer: *mut c_void, dwLength: DWORD, dwMode: DWORD) -> bool;
-    pub fn ctListDelete(hTag: HANDLE) -> bool;
+    pub fn ctListData(hTag: HANDLE, pBuffer: *mut c_void, dwLength: DWORD, dwMode: DWORD) -> BOOL;
+    pub fn ctListDelete(hTag: HANDLE) -> BOOL;
     pub fn ctListEvent(hCTAPI: HANDLE, dwMode: DWORD) -> HANDLE;
-    pub fn ctListFree(hList: HANDLE) -> bool;
+    pub fn ctListFree(hList: HANDLE) -> BOOL;
     pub fn ctListItem(
         hTag: HANDLE,
         dwitem: DWORD,
         pBuffer: *mut c_void,
         dwLength: DWORD,
         dwMode: DWORD,
-    ) -> bool;
+    ) -> BOOL;
     pub fn ctListNew(hTag: HANDLE, dwMode: DWORD) -> HANDLE;
-    pub fn ctListRead(hList: HANDLE, pctOverlapped: *mut OVERLAPPED) -> bool;
-    pub fn ctListWrite(hTag: HANDLE, sValue: LPCSTR, pctOverlapped: *mut OVERLAPPED) -> bool;
+    pub fn ctListRead(hList: HANDLE, pctOverlapped: *mut OVERLAPPED) -> BOOL;
+    pub fn ctListWrite(hTag: HANDLE, sValue: LPCSTR, pctOverlapped: *mut OVERLAPPED) -> BOOL;
     pub fn ctOpen(sComputer: LPCSTR, sUser: LPCSTR, sPassword: LPCSTR, nMode: u32) -> HANDLE;
     pub fn ctOpenEx(
         sComputer: LPCSTR,
@@ -296,13 +298,13 @@ unsafe extern "system" {
         sPassword: LPCSTR,
         nMode: DWORD,
         hCTAPI: HANDLE,
-    ) -> bool;
+    ) -> BOOL;
     pub fn ctRawToEng(
         pResult: *mut f64,
         dValue: f64,
         pScale: *const CtScale,
         dwMode: DWORD,
-    ) -> bool;
+    ) -> BOOL;
     pub fn ctTagGetProperty(
         hCTAPI: HANDLE,
         szTagName: LPCSTR,
@@ -310,22 +312,21 @@ unsafe extern "system" {
         pData: *mut c_void,
         dwBufferLength: DWORD,
         dwType: DWORD,
-    ) -> bool;
-    pub fn ctTagRead(hCTAPI: HANDLE, sTag: LPCSTR, sValue: LPSTR, dwLength: DWORD) -> bool;
+    ) -> BOOL;
+    pub fn ctTagRead(hCTAPI: HANDLE, sTag: LPCSTR, sValue: LPSTR, dwLength: DWORD) -> BOOL;
     pub fn ctTagReadEx(
         hCTAPI: HANDLE,
         sTag: LPCSTR,
         sValue: LPSTR,
         dwLength: DWORD,
         pctTagvalueItems: *mut CtTagValueItems,
-    ) -> bool;
-    pub fn ctTagWrite(hCTAPI: HANDLE, sTag: LPCSTR, sValue: LPCSTR) -> bool;
+    ) -> BOOL;
+    pub fn ctTagWrite(hCTAPI: HANDLE, sTag: LPCSTR, sValue: LPCSTR) -> BOOL;
     pub fn ctTagWriteEx(
         hCTAPI: HANDLE,
         sTag: LPCSTR,
         sValue: LPCSTR,
         pctOverlapped: *mut OVERLAPPED,
-    ) -> bool;
+    ) -> BOOL;
 
 }
-

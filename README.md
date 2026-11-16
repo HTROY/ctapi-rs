@@ -15,7 +15,7 @@ ctapi-rs 是一个安全、高性能的 Rust 库，用于与 Citect SCADA 系统
 - 🔧 **易于使用**: 简洁的 API 设计，支持现代 Rust 最佳实践
 - 🔄 **错误处理**: 强类型错误系统，提供详细的错误信息
 - 🌏 **编码支持**: 完整的 GBK/UTF-8 编码转换支持
-- ⚡ **异步操作**: 基于 OVERLAPPED I/O 的非阻塞异步 API
+- ⚡ **异步操作**: 在工作线程执行 CtAPI 的非阻塞异步接口
 - 🦀 **Tokio 集成**: 原生支持 async/await 语法（可选）
 
 ## 系统要求
@@ -163,6 +163,8 @@ fn multi_threaded_reads() -> Result<()> {
 - 确保所有派生对象（如 `CtFind`、`CtList`）在 `CtClient` 被 drop 前释放
 
 ### 异步操作
+
+安全异步接口在拥有连接、参数和结果缓冲区的工作线程中执行。超时或释放 Future 会结束等待，已经开始的 CtAPI 调用仍可能完成。详见 [异步 API 指南](ASYNC_API.md)。
 
 ```rust
 use ctapi_rs::{CtClient, AsyncOperation, AsyncCtClient};

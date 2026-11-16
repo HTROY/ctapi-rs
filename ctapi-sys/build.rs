@@ -6,13 +6,14 @@ fn main() {
     let out_dir_string = env::var("OUT_DIR").unwrap();
     let manifest_dir_string = env::var("CARGO_MANIFEST_DIR").unwrap();
     let target = env::var("TARGET").unwrap();
-    let out_dir = Path::new(&out_dir_string)
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap();
+    // Cargo has used both build/<hash>/out and build/<package>/<hash>/out.
+    let target_profile = Path::new(&out_dir_string)
+        .ancestors()
+        .find(|path| path.file_name().is_some_and(|name| name == "build"))
+        .and_then(Path::parent)
+        .expect("Cargo profile directory");
+    let deps_dir = target_profile.join("deps");
+    fs::create_dir_all(&deps_dir).expect("create Cargo dependencies directory");
     let mut lib_dir = Path::new(&manifest_dir_string).join("lib");
 
     if target.contains("i686") {
@@ -30,20 +31,9 @@ fn main() {
     {
         let entry = entry.unwrap();
         let path = entry.path();
-        if path.is_file()
-            && !Path::new(&out_dir)
-                .join("deps")
-                .join(path.file_name().unwrap())
-                .as_path()
-                .exists()
-        {
-            fs::copy(
-                &path,
-                Path::new(&out_dir)
-                    .join("deps")
-                    .join(path.file_name().unwrap()),
-            )
-            .unwrap();
+        let destination = deps_dir.join(entry.file_name());
+        if path.is_file() && !destination.exists() {
+            fs::copy(&path, &destination).unwrap();
         }
     }
 }

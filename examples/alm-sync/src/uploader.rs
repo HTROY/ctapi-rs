@@ -1,7 +1,11 @@
 use crate::config::UploadConfig;
 use crate::local_db::{AlarmRecord, LocalDb};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, ensure};
+use connection_string::AdoNetString;
 use log::{error, info, warn};
+use sha2::{Digest, Sha256};
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
+use std::str::FromStr;
 use std::time::Duration;
 use tokio::time::sleep;
 
@@ -89,10 +93,7 @@ async fn insert_batch_pg(pool: &sqlx::PgPool, records: &[AlarmRecord]) -> Result
     Ok(result.rows_affected() as usize)
 }
 
-async fn insert_batch_mssql(
-    client: &mut MssqlClient,
-    records: &[AlarmRecord],
-) -> Result<usize> {
+async fn insert_batch_mssql(client: &mut MssqlClient, records: &[AlarmRecord]) -> Result<usize> {
     use tiberius::ToSql;
     let mut count = 0usize;
     for r in records {
@@ -121,59 +122,113 @@ async fn insert_batch_mssql(
     Ok(count)
 }
 
-async fn build_pg_pool(config: &UploadConfig) -> Result<sqlx::PgPool> {
-    let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&config.connection_string)
-        .await
-        .context("Failed to connect to PostgreSQL")?;
-    Ok(pool)
+pub enum UploadConnection {
+    Postgres(PgConnectOptions),
+    Mssql(tiberius::Config),
 }
 
-async fn build_mssql_client(config: &UploadConfig) -> Result<MssqlClient> {
+impl UploadConnection {
+    /// Resolve transport policy and cache identity from the configuration
+    /// used by the actual connection. Identity fields exclude passwords.
+    pub fn prepare(config: &UploadConfig) -> Result<(Self, String)> {
+        match config.target.as_str() {
+            "postgresql" => {
+                let options = PgConnectOptions::from_str(&config.connection_string)
+                    .map_err(|_| anyhow!("Invalid PostgreSQL connection string"))?
+                    .ssl_mode(PgSslMode::VerifyFull);
+                let database = options
+                    .get_database()
+                    .unwrap_or_else(|| options.get_username());
+                let identity = identity_digest(&(
+                    "postgresql",
+                    options.get_host(),
+                    options.get_port(),
+                    options.get_socket(),
+                    database,
+                    options.get_username(),
+                    options.get_options(),
+                ))?;
+                Ok((Self::Postgres(options), identity))
+            }
+            "mssql" => {
+                // Match Tiberius's ADO.NET key and quoting rules, including
+                // duplicate-key precedence and semicolons inside passwords.
+                let fields = AdoNetString::from_str(&config.connection_string)
+                    .map_err(|_| anyhow!("Invalid MSSQL ADO.NET connection string"))?;
+                let skip_certificate = fields.get("trustservercertificate").is_some_and(|value| {
+                    let value = value.trim();
+                    value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+                });
+                ensure!(
+                    !skip_certificate,
+                    "MSSQL requires server certificate validation"
+                );
+                let mut options = tiberius::Config::from_ado_string(&config.connection_string)
+                    .map_err(|_| anyhow!("Invalid MSSQL ADO.NET connection options"))?;
+                options.encryption(tiberius::EncryptionLevel::Required);
+                let database = fields
+                    .get("database")
+                    .or_else(|| fields.get("initial catalog"))
+                    .or_else(|| fields.get("databasename"))
+                    .filter(|name| !name.is_empty())
+                    .context("MSSQL requires an explicit database name to bind the sync state")?;
+                let user = fields
+                    .get("uid")
+                    .or_else(|| fields.get("username"))
+                    .or_else(|| fields.get("user"))
+                    .or_else(|| fields.get("user id"));
+                let identity = identity_digest(&("mssql", options.get_addr(), database, user))?;
+                Ok((Self::Mssql(options), identity))
+            }
+            _ => Err(anyhow!("Upload target must be postgresql or mssql")),
+        }
+    }
+}
+
+fn identity_digest<T: serde::Serialize>(fields: &T) -> Result<String> {
+    Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(fields)?)))
+}
+
+async fn build_mssql_client(config: &tiberius::Config) -> Result<MssqlClient> {
     use tokio_util::compat::TokioAsyncWriteCompatExt;
-    let tcfg = tiberius::Config::from_ado_string(&config.connection_string)
-        .context("Failed to parse MSSQL ADO.NET connection string")?;
-    let tcp = tokio::net::TcpStream::connect(tcfg.get_addr())
+    let tcp = tokio::net::TcpStream::connect(config.get_addr())
         .await
         .context("Failed to connect to MSSQL server")?;
     tcp.set_nodelay(true)?;
-    let compat = tcp.compat_write();
-    let client = tiberius::Client::connect(tcfg, compat)
+    tiberius::Client::connect(config.clone(), tcp.compat_write())
         .await
-        .context("Failed to create MSSQL client")?;
-    Ok(client)
+        .context("Failed to create MSSQL client")
 }
 
 /// Background upload loop.
 pub async fn upload_loop(
     db: LocalDb,
     config: UploadConfig,
+    connection: UploadConnection,
     shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let target = config.target.clone();
     info!(
         "Upload loop started, target={}, batch_size={}",
-        target, config.batch_size
+        config.target, config.batch_size
     );
-
-    match target.as_str() {
-        "postgresql" => upload_loop_pg(db, config, shutdown).await,
-        "mssql" => upload_loop_mssql(db, config, shutdown).await,
-        _ => {
-            error!("Unsupported upload target: {}", target);
-        }
+    match connection {
+        UploadConnection::Postgres(options) => upload_loop_pg(db, config, options, shutdown).await,
+        UploadConnection::Mssql(options) => upload_loop_mssql(db, config, options, shutdown).await,
     }
-
     info!("Upload loop finished");
 }
 
 async fn upload_loop_pg(
     db: LocalDb,
     config: UploadConfig,
+    connection: PgConnectOptions,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let pool = match build_pg_pool(&config).await {
+    let pool = match sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .connect_with(connection)
+        .await
+    {
         Ok(p) => p,
         Err(e) => {
             error!("Failed to connect to PostgreSQL: {}", e);
@@ -238,9 +293,10 @@ async fn upload_loop_pg(
 async fn upload_loop_mssql(
     db: LocalDb,
     config: UploadConfig,
+    connection: tiberius::Config,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
-    let mut client = match build_mssql_client(&config).await {
+    let mut client = match build_mssql_client(&connection).await {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to connect to MSSQL: {}", e);
@@ -294,12 +350,59 @@ async fn upload_loop_mssql(
                 if let Err(e2) = db.mark_failed(&log_ids, &e.to_string()).await {
                     error!("Failed to mark records as failed: {}", e2);
                 }
-                match build_mssql_client(&config).await {
+                match build_mssql_client(&connection).await {
                     Ok(c) => client = c,
                     Err(e2) => error!("Failed to reconnect to MSSQL: {}", e2),
                 }
                 sleep(Duration::from_secs(config.retry_interval_secs)).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config(target: &str, connection_string: &str) -> UploadConfig {
+        UploadConfig {
+            target: target.to_owned(),
+            connection_string: connection_string.to_owned(),
+            batch_size: 100,
+            retry_max: 3,
+            retry_interval_secs: 30,
+        }
+    }
+
+    #[test]
+    fn postgres_requires_peer_verification_and_tracks_database() {
+        let build = |database: &str, password: &str| {
+            UploadConnection::prepare(&config(
+                "postgresql",
+                &format!("postgresql://tester:{password}@db.example/{database}?sslmode=disable"),
+            ))
+            .unwrap()
+        };
+        let (connection, identity) = build("alarms", "fixture");
+        let UploadConnection::Postgres(options) = connection else {
+            panic!("unexpected upload backend");
+        };
+        assert!(matches!(options.get_ssl_mode(), PgSslMode::VerifyFull));
+        assert_eq!(identity, build("alarms", "rotated").1);
+        assert_ne!(identity, build("archive", "fixture").1);
+    }
+
+    #[test]
+    fn mssql_accepts_quoted_values_and_requires_certificate_validation() {
+        let build = |certificate: &str| {
+            UploadConnection::prepare(&config(
+                "mssql",
+                &format!(
+                    "Server=db.example;Database=alarms;UID=tester;PWD='a;b';TrustServerCertificate={certificate}"
+                ),
+            ))
+        };
+        assert!(build("false").is_ok());
+        assert!(build(" YeS ").is_err());
     }
 }

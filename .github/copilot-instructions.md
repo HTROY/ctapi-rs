@@ -72,7 +72,7 @@ let result = extract_string_from_buffer(&buffer)?;
 
 ### 测试约定
 - 集成测试使用硬编码测试服务器 (见 `lib.rs` 中的 `COMPUTER`, `USER`, `PASSWORD` 常量)
-- 测试需要实际的 Citect SCADA 环境，无法进行模拟测试
+- 实机集成测试需要专用 Citect SCADA 环境。本地单元测试使用合成数据。
 - 使用 `#[test]` 而非 `tests/` 目录以便访问私有 API
 
 ### 命名模式

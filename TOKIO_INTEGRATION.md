@@ -382,17 +382,9 @@ for tag in &tags {
 }
 ```
 
-## 对比：OVERLAPPED vs Tokio
+## 任务所有权和超时
 
-| 特性 | OVERLAPPED API | Tokio API |
-|------|---------------|-----------|
-| 语法 | 手动轮询/等待 | async/await |
-| 并发模型 | 需要手动管理 | 自动任务调度 |
-| 取消支持 | 显式取消 | Drop 时取消 |
-| 超时处理 | 手动实现 | `tokio::time::timeout` |
-| 生态集成 | 无 | 完整 tokio 生态 |
-| 性能开销 | 最低 | 轻微（spawn_blocking） |
-| 适用场景 | 性能关键代码 | 业务逻辑代码 |
+`FutureCtClient` 和 `FutureCtList` 使用独立工作线程。Tokio 接口使用运行时的阻塞线程池。释放 Future 或等待超时后，已经启动的原生调用仍可完成。应用应确认写入结果后再重试。
 
 ## 线程安全
 
@@ -490,4 +482,4 @@ async fn main() {
 
 - [Tokio 官方文档](https://tokio.rs)
 - [Async Rust 书籍](https://rust-lang.github.io/async-book/)
-- [ASYNC_API.md](ASYNC_API.md) - OVERLAPPED API 文档
+- [ASYNC_API.md](ASYNC_API.md) - 异步 API 文档

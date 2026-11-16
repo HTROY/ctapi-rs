@@ -1,12 +1,16 @@
 use ctapi_rs::CtClient;
 use std::sync::Arc;
 
-const COMPUTER: &str = "127.0.0.1";
-const USER: &str = "Engineer";
-const PASSWORD: &str = "Citect";
-
-fn main() {
-    let client = Arc::new(CtClient::open(Some(COMPUTER), Some(USER), Some(PASSWORD), 0).unwrap());
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let computer = std::env::var("CITECT_COMPUTER")?;
+    let user = std::env::var("CITECT_USER")?;
+    let password = std::env::var("CITECT_PASSWORD")?;
+    let client = Arc::new(CtClient::open(
+        Some(&computer),
+        Some(&user),
+        Some(&password),
+        ctapi_rs::CT_OPEN_CRYPT,
+    )?);
     let list = client.list_new(0).unwrap();
     list.add_tag("TagExt_DemoTag1").unwrap();
     list.add_tag("TagExt_DemoTag1_Mirror").unwrap();

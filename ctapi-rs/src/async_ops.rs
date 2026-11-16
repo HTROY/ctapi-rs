@@ -1,347 +1,311 @@
-//! Asynchronous operations using OVERLAPPED I/O
+//! Nonblocking Rust adapters for synchronous CtAPI calls.
 //!
-//! This module provides two layers of async support:
-//!
-//! ## Callback-style (OVERLAPPED)
-//! - [`AsyncOperation`] - Windows OVERLAPPED-based async operation handle
-//! - [`AsyncCtClient`] - Extension trait for starting OVERLAPPED async operations
-//!
-//! ## Future / async-await style
-//! - [`CtApiFuture`] - A `std::future::Future` wrapping an OVERLAPPED operation
-//! - [`FutureCtClient`] - Extension trait returning `CtApiFuture` for `.await` usage
-//!
-//! # Examples
-//!
-//! ```no_run
-//! use ctapi_rs::{CtClient, FutureCtClient};
-//!
-//! async fn run() -> anyhow::Result<()> {
-//!     let client = CtClient::open(None, None, None, 0)?;
-//!
-//!     // Await directly no tokio::spawn_blocking needed
-//!     let result = client.cicode_future("Time(1)", 0, 0)?.await?;
-//!     println!("Time: {}", result);
-//!     Ok(())
-//! }
-//! ```
+//! Workers own the connection, arguments and result storage until CtAPI
+//! returns. Dropping a waiter abandons the result. A call that has already
+//! started can still finish and have effects on the server.
 
-use std::future::Future;
-use std::os::windows::io::RawHandle;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Waker};
-
-use crate::CtClient;
-use crate::CtList;
+use crate::client::extract_string_from_buffer;
 use crate::error::{CtApiError, Result};
 use crate::util::encode_to_gbk_cstring;
-use ctapi_sys::*;
-use encoding_rs::GBK;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use crate::{CtClient, CtList};
+use ctapi_sys::OVERLAPPED;
+use std::fmt;
+use std::future::Future;
+use std::io::{Error, ErrorKind};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::Pin;
+use std::sync::{Arc, Condvar, Mutex};
+use std::task::{Context, Poll, Waker};
 use windows_sys::Win32::System::Threading::CreateEventA;
-use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
-/// `WaitForSingleObject` return value: timeout elapsed without the object being signalled.
-const WAIT_TIMEOUT: u32 = 0x0000_0102;
+const DEFAULT_BUFFER_SIZE: usize = 256;
 
-/// An owned Windows event handle that can be safely shared across threads via [`Arc`].
-/// The event is automatically closed (via `CloseHandle`) when the last `Arc` reference
-/// is dropped, ensuring the handle stays valid as long as any thread still needs it.
-struct WinEvent(HANDLE);
-
-impl WinEvent {
-    /// Create a new manual-reset, initially-unsignalled event.
-    fn new() -> Self {
-        // SAFETY: CreateEventA with null security attributes, manual-reset,
-        // initially unsignalled, and no name is always safe to call.
-        let h = unsafe { CreateEventA(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
-        assert!(!h.is_null(), "CreateEventA failed");
-        Self(h)
-    }
-
-    /// Return the raw Windows `HANDLE` value.
-    #[inline]
-    fn handle(&self) -> HANDLE {
-        self.0
-    }
+enum Phase<T> {
+    Queued,
+    Running,
+    Finished(Option<Result<T>>),
 }
 
-impl Drop for WinEvent {
-    fn drop(&mut self) {
-        if !self.0.is_null() && self.0 as isize != -1 {
-            // SAFETY: self.0 is a valid HANDLE from CreateEventA. Arc<WinEvent>
-            // guarantees this drop runs only once after all references are gone.
-            unsafe { CloseHandle(self.0) };
+struct Completion<T> {
+    phase: Phase<T>,
+    waker: Option<Waker>,
+}
+
+impl<T> Completion<T> {
+    fn take_result(&mut self) -> Option<Result<T>> {
+        match &mut self.phase {
+            Phase::Queued | Phase::Running => None,
+            Phase::Finished(result) => Some(result.take().unwrap_or_else(|| {
+                Err(Error::new(
+                    ErrorKind::InvalidInput,
+                    "CtAPI operation result was already collected",
+                )
+                .into())
+            })),
         }
     }
 }
 
-// SAFETY: A Windows kernel-object handle is a numeric identifier that can be
-// duplicated and passed between threads freely; the kernel synchronises access.
-unsafe impl Send for WinEvent {}
-unsafe impl Sync for WinEvent {}
-
-/// FutureState shared between CtApiFuture and the waker thread
-struct FutureState {
-    waker: Mutex<Option<Waker>>,
-    cancelled: AtomicBool,
+struct Shared<T> {
+    completion: Mutex<Completion<T>>,
+    ready: Condvar,
 }
 
-/// Represents an asynchronous operation handle.
-///
-/// This structure wraps a Windows OVERLAPPED structure and provides safe
-/// access to asynchronous CtAPI operations.
-///
-/// # Thread Safety
-///
-/// `AsyncOperation` is NOT thread-safe. Each thread should create and manage
-/// its own async operations. The OVERLAPPED structure must not be moved or
-/// modified while an operation is in progress.
-///
-/// # Examples
-///
-/// ```no_run
-/// use ctapi_rs::{CtClient, AsyncOperation};
-///
-/// let client = CtClient::open(None, None, None, 0)?;
-/// let mut async_op = AsyncOperation::new();
-///
-/// // Start async cicode execution
-/// use ctapi_rs::AsyncCtClient;
-/// client.cicode_async("SomeFunction()", 0, 0, &mut async_op)?;
-///
-/// // Wait for completion
-/// let result = async_op.get_result(&client)?;
-/// println!("Result: {}", result);
-/// # Ok::<(), ctapi_rs::CtApiError>(())
-/// ```
-pub struct AsyncOperation {
+struct Work<T> {
+    shared: Arc<Shared<T>>,
+}
+
+impl<T> Work<T> {
+    fn spawn(job: impl FnOnce() -> Result<T> + Send + 'static) -> Result<Self>
+    where
+        T: Send + 'static,
+    {
+        let shared = Arc::new(Shared {
+            completion: Mutex::new(Completion {
+                phase: Phase::Queued,
+                waker: None,
+            }),
+            ready: Condvar::new(),
+        });
+        let worker = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("ctapi-call".into())
+            .spawn(move || {
+                {
+                    let mut completion = worker.completion.lock().unwrap();
+                    if !matches!(completion.phase, Phase::Queued) {
+                        return;
+                    }
+                    completion.phase = Phase::Running;
+                }
+
+                let result = catch_unwind(AssertUnwindSafe(job))
+                    .unwrap_or_else(|_| Err(Error::other("CtAPI worker panicked").into()));
+                let waker = {
+                    let mut completion = worker.completion.lock().unwrap();
+                    completion.phase = Phase::Finished(Some(result));
+                    completion.waker.take()
+                };
+                worker.ready.notify_all();
+                if let Some(waker) = waker {
+                    waker.wake();
+                }
+            })?;
+        Ok(Self { shared })
+    }
+
+    fn is_complete(&self) -> bool {
+        let completion = self.shared.completion.lock().unwrap();
+        matches!(completion.phase, Phase::Finished(_))
+    }
+
+    fn try_result(&self) -> Option<Result<T>> {
+        self.shared.completion.lock().unwrap().take_result()
+    }
+
+    fn wait(&self) -> Result<T> {
+        let mut completion = self.shared.completion.lock().unwrap();
+        loop {
+            if let Some(result) = completion.take_result() {
+                return result;
+            }
+            completion = self.shared.ready.wait(completion).unwrap();
+        }
+    }
+
+    fn poll(&self, cx: &Context<'_>) -> Poll<Result<T>> {
+        let waker = cx.waker().clone();
+        let old_waker = {
+            let mut completion = self.shared.completion.lock().unwrap();
+            if let Some(result) = completion.take_result() {
+                return Poll::Ready(result);
+            }
+            completion.waker.replace(waker)
+        };
+        drop(old_waker);
+        Poll::Pending
+    }
+
+    fn cancel(&self) -> Result<()> {
+        let waker = {
+            let mut completion = self.shared.completion.lock().unwrap();
+            match completion.phase {
+                Phase::Queued => {
+                    completion.phase = cancelled();
+                    completion.waker.take()
+                }
+                Phase::Running => {
+                    return Err(CtApiError::UnsupportedOperation {
+                        operation: "cancel an already-running CtAPI call".to_owned(),
+                    });
+                }
+                Phase::Finished(_) => return Ok(()),
+            }
+        };
+        self.shared.ready.notify_all();
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        Ok(())
+    }
+}
+
+fn cancelled<T>() -> Phase<T> {
+    Phase::Finished(Some(Err(Error::new(
+        ErrorKind::Interrupted,
+        "CtAPI call cancelled before it started",
+    )
+    .into())))
+}
+
+impl<T> Drop for Work<T> {
+    fn drop(&mut self) {
+        let waker = {
+            let mut completion = self.shared.completion.lock().unwrap();
+            if matches!(completion.phase, Phase::Queued) {
+                completion.phase = cancelled();
+            }
+            completion.waker.take()
+        };
+        drop(waker);
+    }
+}
+
+// Kept solely for callers that explicitly opt into raw, caller-managed I/O.
+struct RawOperation {
     overlapped: OVERLAPPED,
-    buffer: Vec<u8>,
-    /// Ref-counted event handle shared with [`CtApiFuture`]'s waker thread so
-    /// that the kernel object is not closed while a thread is waiting on it.
-    win_event: Arc<WinEvent>,
+    _buffer: Box<[u8]>,
+    _event: OwnedHandle,
+}
+
+impl RawOperation {
+    fn new(buffer_size: usize) -> Self {
+        let mut buffer = vec![0; buffer_size].into_boxed_slice();
+        // SAFETY: An unnamed manual-reset event with default security.
+        let handle = unsafe { CreateEventA(std::ptr::null_mut(), 1, 0, std::ptr::null()) };
+        assert!(!handle.is_null(), "CreateEventA failed");
+        // SAFETY: CreateEventA transferred a valid handle to this caller.
+        let event = unsafe { OwnedHandle::from_raw_handle(handle) };
+        let mut overlapped = OVERLAPPED::new();
+        overlapped.hEvent = event.as_raw_handle();
+        overlapped.pData = buffer.as_mut_ptr();
+        Self {
+            overlapped,
+            _buffer: buffer,
+            _event: event,
+        }
+    }
+}
+
+/// A caller-managed handle to a nonblocking CtAPI operation.
+///
+/// Safe methods submit blocking native calls to owned workers. Use the
+/// originating client when collecting the result, even for list operations.
+pub struct AsyncOperation {
+    buffer_size: usize,
+    active: Option<(CtClient, Work<String>)>,
+    raw: Option<Box<RawOperation>>,
 }
 
 impl AsyncOperation {
-    /// Create a new async operation with the default 256-byte result buffer.
+    /// Create an operation with the default Cicode response-buffer size.
     pub fn new() -> Self {
-        Self::with_buffer_size(256)
+        Self::with_buffer_size(DEFAULT_BUFFER_SIZE)
     }
 
-    /// Create a new async operation with a custom result-buffer size.
-    ///
-    /// # Parameters
-    /// * `buffer_size` - Capacity of the internal buffer used to receive results.
+    /// Create an operation with a custom Cicode response-buffer size.
     pub fn with_buffer_size(buffer_size: usize) -> Self {
-        let win_event = Arc::new(WinEvent::new());
-        let mut buffer = vec![0u8; buffer_size];
-
-        let mut overlapped = OVERLAPPED::new();
-        overlapped.hEvent = win_event.handle();
-        overlapped.dwStatus = 0;
-        overlapped.dwLength = 0;
-        overlapped.pData = buffer.as_mut_ptr();
-
         Self {
-            overlapped,
-            buffer,
-            win_event,
+            buffer_size,
+            active: None,
+            raw: None,
         }
     }
 
-    /// Return a raw mutable pointer to the internal OVERLAPPED structure.
+    /// Get a raw CtAPI OVERLAPPED pointer for caller-managed foreign I/O.
     ///
     /// # Safety
     ///
-    /// The OVERLAPPED structure must not be modified while an I/O operation
-    /// is in progress.  Misuse can lead to undefined behaviour.
+    /// The caller must use the raw CtAPI bindings to submit, synchronize,
+    /// cancel, and collect any request using this pointer. The operation
+    /// and its native buffers must stay alive until CtAPI is finished with
+    /// them. Safe methods on this type manage only Rust worker requests.
     pub unsafe fn overlapped_mut(&mut self) -> *mut OVERLAPPED {
-        &mut self.overlapped
+        let raw = self
+            .raw
+            .get_or_insert_with(|| Box::new(RawOperation::new(self.buffer_size)));
+        &mut raw.overlapped
     }
 
-    /// Return `true` if the async operation has completed.
-    ///
-    /// The check is based on `dwStatus != STATUS_PENDING (0x103)`.
-    ///
-    /// # Examples
-    /// ```no_run
-    /// # use ctapi_rs::{CtClient, AsyncOperation, AsyncCtClient};
-    /// # let client = CtClient::open(None, None, None, 0)?;
-    /// let mut op = AsyncOperation::new();
-    /// client.cicode_async("Sleep(5)", 0, 0, &mut op)?;
-    ///
-    /// while !op.is_complete() {
-    ///     std::thread::sleep(std::time::Duration::from_millis(100));
-    /// }
-    /// # Ok::<(), ctapi_rs::CtApiError>(())
-    /// ```
+    /// Return whether the safe operation has completed or is idle.
     pub fn is_complete(&self) -> bool {
-        const STATUS_PENDING: DWORD = 0x103;
-        self.overlapped.dwStatus != STATUS_PENDING
+        self.active
+            .as_ref()
+            .is_none_or(|(_, work)| work.is_complete())
     }
 
-    /// The raw Windows event handle associated with this operation's
-    /// OVERLAPPED structure. Signalled when the async operation completes.
-    pub(crate) fn win_event_handle(&self) -> HANDLE {
-        self.win_event.handle()
-    }
-
-    /// Block until the operation completes and return the string result.
-    ///
-    /// # Parameters
-    /// * `client` - The [`CtClient`] used to start this operation.
-    ///
-    /// # Errors
-    /// * [`CtApiError::System`] - Operation failed or was cancelled.
-    ///
-    /// # Examples
-    /// ```no_run
-    /// # use ctapi_rs::{CtClient, AsyncOperation, AsyncCtClient};
-    /// # let client = CtClient::open(None, None, None, 0)?;
-    /// let mut op = AsyncOperation::new();
-    /// client.cicode_async("Time(1)", 0, 0, &mut op)?;
-    /// let result = op.get_result(&client)?;
-    /// println!("Time: {}", result);
-    /// # Ok::<(), ctapi_rs::CtApiError>(())
-    /// ```
+    /// Wait for and collect the result of the safe operation.
     pub fn get_result(&mut self, client: &CtClient) -> Result<String> {
-        self.get_result_impl(client.handle(), true)
+        self.work(client)?.wait()
     }
 
-    /// Try to get the result without blocking.
-    ///
-    /// Returns `None` if the operation is still in progress.
-    ///
-    /// # Parameters
-    /// * `client` - The [`CtClient`] used to start this operation.
-    ///
-    /// # Examples
-    /// ```no_run
-    /// # use ctapi_rs::{CtClient, AsyncOperation, AsyncCtClient};
-    /// # let client = CtClient::open(None, None, None, 0)?;
-    /// let mut op = AsyncOperation::new();
-    /// client.cicode_async("LongFunc()", 0, 0, &mut op)?;
-    ///
-    /// loop {
-    ///     match op.try_get_result(&client) {
-    ///         Some(Ok(v))  => { println!("Done: {}", v); break; }
-    ///         Some(Err(e)) => { eprintln!("Error: {}", e); break; }
-    ///         None         => std::thread::sleep(std::time::Duration::from_millis(50)),
-    ///     }
-    /// }
-    /// # Ok::<(), ctapi_rs::CtApiError>(())
-    /// ```
+    /// Collect the result once ready, or return None while work is pending.
     pub fn try_get_result(&mut self, client: &CtClient) -> Option<Result<String>> {
-        let mut bytes_transferred: u32 = 0;
-
-        // SAFETY: client.handle() is a valid CtAPI handle. &mut self.overlapped is
-        // a valid pointer to an OVERLAPPED struct that was previously passed to an
-        // async CtAPI call. bytes_transferred is a local stack variable.
-        unsafe {
-            if ctGetOverlappedResult(
-                client.handle(),
-                &mut self.overlapped,
-                &mut bytes_transferred,
-                false,
-            ) {
-                let result_len = bytes_transferred.min(self.buffer.len() as u32) as usize;
-                let result_slice = &self.buffer[..result_len];
-                let result = std::ffi::CStr::from_bytes_until_nul(result_slice)
-                    .map_err(CtApiError::FromBytesUntilNul)
-                    .map(|cstr| GBK.decode(cstr.to_bytes()).0.to_string());
-                Some(result)
-            } else {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(997) {
-                    // ERROR_IO_INCOMPLETE still pending
-                    None
-                } else {
-                    Some(Err(err.into()))
-                }
-            }
+        match self.work(client) {
+            Ok(work) => work.try_result(),
+            Err(error) => Some(Err(error)),
         }
     }
 
-    /// Attempt to cancel the pending async operation.
+    /// Cancel a queued operation before it starts.
     ///
-    /// Cancellation may not be immediate; the operation might still complete.
-    ///
-    /// # Parameters
-    /// * `client` - The [`CtClient`] used to start this operation.
-    ///
-    /// # Examples
-    /// ```no_run
-    /// # use ctapi_rs::{CtClient, AsyncOperation, AsyncCtClient};
-    /// # let client = CtClient::open(None, None, None, 0)?;
-    /// let mut op = AsyncOperation::new();
-    /// client.cicode_async("Sleep(60)", 0, 0, &mut op)?;
-    /// op.cancel(&client)?;
-    /// # Ok::<(), ctapi_rs::CtApiError>(())
-    /// ```
+    /// An already-running native call returns an unsupported-operation error.
+    /// A completed operation retains its result.
     pub fn cancel(&mut self, client: &CtClient) -> Result<()> {
-        // SAFETY: client.handle() is a valid CtAPI handle. &mut self.overlapped
-        // points to the OVERLAPPED struct associated with the pending operation.
-        unsafe {
-            if !ctCancelIO(client.handle(), &mut self.overlapped) {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            Ok(())
+        self.work(client)?.cancel()
+    }
+
+    /// Clear the operation for reuse after completion.
+    pub fn reset(&mut self) -> Result<()> {
+        if !self.is_complete() {
+            return Err(
+                Error::new(ErrorKind::WouldBlock, "CtAPI operation is still running").into(),
+            );
         }
+        self.active = None;
+        self.raw = None;
+        Ok(())
     }
 
-    /// Reset this `AsyncOperation` for reuse.
-    ///
-    /// Clears the OVERLAPPED status and zeroes the result buffer while
-    /// keeping the same underlying event handle.
-    pub fn reset(&mut self) {
-        let event_handle = self.win_event.handle();
-        self.overlapped = OVERLAPPED::new();
-        self.overlapped.hEvent = event_handle;
-        self.overlapped.pData = self.buffer.as_mut_ptr();
-        self.buffer.fill(0);
-    }
-
-    /// When `wait = false` the caller must ensure the operation has already
-    /// completed (i.e. [`is_complete`] returned `true`).
-    fn get_result_impl(&mut self, client_handle: RawHandle, wait: bool) -> Result<String> {
-        let mut bytes_transferred: u32 = 0;
-        // SAFETY: client_handle is a valid CtAPI connection handle. &mut self.overlapped
-        // is a valid pointer to an OVERLAPPED struct from a previous async call.
-        // bytes_transferred is a local stack variable.
-        unsafe {
-            if !ctGetOverlappedResult(
-                client_handle,
-                &mut self.overlapped,
-                &mut bytes_transferred,
-                wait,
-            ) {
-                return Err(std::io::Error::last_os_error().into());
-            }
-            // Operations like tag writes may transfer 0 bytes return empty string.
-            if bytes_transferred == 0 {
-                return Ok(String::new());
-            }
-            let result_len = bytes_transferred.min(self.buffer.len() as u32) as usize;
-            let result_slice = &self.buffer[..result_len];
-            let cstr = std::ffi::CStr::from_bytes_until_nul(result_slice)
-                .map_err(CtApiError::FromBytesUntilNul)?;
-            Ok(GBK.decode(cstr.to_bytes()).0.to_string())
+    pub(crate) fn start(
+        &mut self,
+        client: &CtClient,
+        job: impl FnOnce() -> Result<String> + Send + 'static,
+    ) -> Result<()> {
+        if !self.is_complete() {
+            return Err(
+                Error::new(ErrorKind::WouldBlock, "CtAPI operation is still running").into(),
+            );
         }
+        self.active = Some((client.clone(), Work::spawn(job)?));
+        Ok(())
     }
 
-    /// Non-blocking result extraction used by [`CtApiFuture`] after the
-    /// operation is known to have completed.
-    pub(crate) fn get_result_with_handle(&mut self, client_handle: RawHandle) -> Result<String> {
-        self.get_result_impl(client_handle, false)
-    }
-}
-
-impl Drop for AsyncOperation {
-    fn drop(&mut self) {
-        // The event handle lifetime is managed by Arc<WinEvent>.
-        // No explicit CloseHandle needed here.
+    fn work(&self, client: &CtClient) -> Result<&Work<String>> {
+        match &self.active {
+            Some((owner, work)) if owner.same_connection(client) => Ok(work),
+            Some(_) => Err(Error::new(
+                ErrorKind::InvalidInput,
+                "CtAPI operation belongs to a different client",
+            )
+            .into()),
+            None => Err(Error::new(
+                ErrorKind::InvalidInput,
+                "No CtAPI operation has been submitted",
+            )
+            .into()),
+        }
     }
 }
 
@@ -351,210 +315,38 @@ impl Default for AsyncOperation {
     }
 }
 
-impl std::fmt::Debug for AsyncOperation {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for AsyncOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("AsyncOperation")
             .field("is_complete", &self.is_complete())
-            .field("buffer_size", &self.buffer.len())
-            .field("event_handle", &self.win_event.handle())
+            .field("buffer_size", &self.buffer_size)
             .finish()
     }
 }
 
-/// Created by [`FutureCtClient`] methods. Supports `.await` in any async context
-/// without requiring Tokio    a lightweight background thread waits on the
-/// Windows event handle and wakes the task when the operation completes.
-///
-/// # Cancellation
-///
-/// Dropping this future before it resolves will:
-/// 1. Signal the internal waker thread to stop.
-/// 2. Call `ctCancelIO` to cancel the pending I/O operation.
-///
-/// # Thread Safety
-///
-/// `CtApiFuture` implements [`Send`]    it can be spawned in Tokio tasks or any
-/// other multi-threaded async runtime.  The internal waker thread only accesses
-/// the Windows event handle (a kernel identifier), never the result buffer or
-/// the client handle directly.
-///
-/// # Examples
-///
-/// ```no_run
-/// use ctapi_rs::{CtClient, FutureCtClient};
-///
-/// #[tokio::main]
-/// async fn main() -> anyhow::Result<()> {
-///     let client = CtClient::open(None, None, None, 0)?;
-///
-///     // Uses OVERLAPPED internally    no spawn_blocking needed
-///     let time  = client.cicode_future("Time(1)", 0, 0)?.await?;
-///     let date  = client.cicode_future("Date(4)", 0, 0)?.await?;
-///     println!("{} {}", time, date);
-///     Ok(())
-/// }
-/// ```
-pub struct CtApiFuture {
-    /// Owned reference to the CtAPI client. This keeps the connection alive
-    /// for the lifetime of this future, even if the caller drops their own
-    /// `CtClient` before this future resolves.
-    client: Arc<CtClient>,
-    /// Boxed so the OVERLAPPED struct is at a stable heap address.
-    /// CtAPI stores a raw `*mut OVERLAPPED` pointer to this struct
-    /// during async operations    moving the future must not move the
-    /// OVERLAPPED, otherwise CtAPI writes to a dangling pointer.
-    async_op: Box<AsyncOperation>,
-    state: Option<Arc<FutureState>>,
-    /// Set to true when poll returns Ready. Prevents ctCancelIO in Drop
-    /// for futures that completed normally. Only accessed under &mut self
-    /// (poll and drop are never concurrent for the same future).
-    finished: bool,
-}
-
-impl CtApiFuture {
-    pub(crate) fn from_boxed(client: &Arc<CtClient>, async_op: Box<AsyncOperation>) -> Self {
-        Self {
-            client: Arc::clone(client),
-            async_op,
-            state: None,
-            finished: false,
-        }
-    }
-}
-
-// SAFETY: Arc<CtClient> is Send + Sync. Box<AsyncOperation> is Send because
-// its fields (OVERLAPPED: now Send + Sync, Vec<u8>: Send, Arc<WinEvent>: Send + Sync)
-// are all Send. Option<Arc<FutureState>> is auto-Send.
-unsafe impl Send for CtApiFuture {}
+/// An awaitable client call. A started native call retains its input and client
+/// until it returns, even if this future is dropped.
+pub struct CtApiFuture(Work<String>);
 
 impl Future for CtApiFuture {
     type Output = Result<String>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-
-        // Fast path already done.
-        if this.async_op.is_complete() {
-            this.finished = true;
-            return Poll::Ready(this.async_op.get_result_with_handle(this.client.handle()));
-        }
-
-        match &this.state {
-            None => {
-                // First poll: create shared state and spawn the waker thread.
-                let state = Arc::new(FutureState {
-                    waker: Mutex::new(Some(cx.waker().clone())),
-                    cancelled: AtomicBool::new(false),
-                });
-                this.state = Some(Arc::clone(&state));
-
-                // Clone the Arc so the event handle stays alive while the
-                // thread is blocked inside WaitForSingleObject.
-                let win_event = Arc::clone(&this.async_op.win_event);
-                let thread_state = Arc::clone(&state);
-
-                std::thread::Builder::new()
-                    .name("ctapi-waker".into())
-                    .spawn(move || {
-                    loop {
-                        if thread_state.cancelled.load(Ordering::Relaxed) {
-                            return;
-                        }
-                        // 100 ms timeout lets us check `cancelled` regularly
-                        // so that dropping the future doesn't strand this thread.
-                        // SAFETY: win_event.handle() is a valid HANDLE from CreateEventA.
-                        // The Arc<WinEvent> keeps it alive for the thread's lifetime.
-                        let status = unsafe { WaitForSingleObject(win_event.handle(), 100) };
-
-                        if thread_state.cancelled.load(Ordering::Relaxed) {
-                            return;
-                        }
-
-                        if status != WAIT_TIMEOUT {
-                            // Operation finished (or handle error) wake the task.
-                            if let Ok(mut lock) = thread_state.waker.lock()
-                                && let Some(waker) = lock.take()
-                            {
-                                waker.wake();
-                            }
-                            return;
-                        }
-                        // WAIT_TIMEOUT loop and try again.
-                    }
-                })
-                .expect("failed to spawn ctapi-waker thread");
-            }
-            Some(state) => {
-                // Subsequent polls (e.g. spurious wake-up): refresh the waker.
-                if let Ok(mut lock) = state.waker.lock() {
-                    *lock = Some(cx.waker().clone());
-                }
-            }
-        }
-
-        Poll::Pending
+        self.0.poll(cx)
     }
 }
 
-impl Drop for CtApiFuture {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        // 1. Tell the waker thread to stop.
-        if let Some(state) = &self.state {
-            state.cancelled.store(true, Ordering::Relaxed);
-        }
-        // 2. Cancel the pending I/O to avoid a dangling OVERLAPPED pointer.
-        if !self.async_op.is_complete() {
-            // SAFETY: self.client is an Arc<CtClient> that keeps the CtAPI
-            // connection alive until this drop completes. The OVERLAPPED pointer
-            // is from self.async_op which is Box-allocated and stable.
-            unsafe {
-                let _ = ctCancelIO(self.client.handle(), self.async_op.overlapped_mut());
-            }
-        }
-    }
-}
-
-impl std::fmt::Debug for CtApiFuture {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for CtApiFuture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CtApiFuture")
-            .field("is_complete", &self.async_op.is_complete())
+            .field("is_complete", &self.0.is_complete())
             .finish()
     }
 }
 
-/// Extension trait providing callback-style (OVERLAPPED) async operations on
-/// [`CtClient`].
-///
-/// Use [`FutureCtClient`] if you prefer the `async`/`await` style instead.
+/// Nonblocking submission of Cicode calls with explicit result collection.
 pub trait AsyncCtClient {
-    /// Execute a Cicode function asynchronously (OVERLAPPED style).
-    ///
-    /// Non-blocking: the operation runs in the background.  Poll for completion
-    /// with [`AsyncOperation::is_complete`] or block with
-    /// [`AsyncOperation::get_result`].
-    ///
-    /// # Parameters
-    /// * `cmd`      - Cicode command string.
-    /// * `vh_win`   - Window handle, usually `0`.
-    /// * `mode`     - Execution mode flag.
-    /// * `async_op` - [`AsyncOperation`] to associate with this call.
-    ///
-    /// # Errors
-    /// * [`CtApiError::System`] - Failed to start the operation.
-    ///
-    /// # Examples
-    /// ```no_run
-    /// use ctapi_rs::{CtClient, AsyncOperation, AsyncCtClient};
-    ///
-    /// let client = CtClient::open(None, None, None, 0)?;
-    /// let mut op = AsyncOperation::new();
-    /// client.cicode_async("Time(1)", 0, 0, &mut op)?;
-    /// let result = op.get_result(&client)?;
-    /// # Ok::<(), ctapi_rs::CtApiError>(())
-    /// ```
+    /// Submit Cicode execution and collect its result via the operation handle.
     fn cicode_async(
         &self,
         cmd: &str,
@@ -572,472 +364,180 @@ impl AsyncCtClient for CtClient {
         mode: u32,
         async_op: &mut AsyncOperation,
     ) -> Result<()> {
-        let cmd = encode_to_gbk_cstring(cmd).map_err(|_| CtApiError::InvalidParameter {
-            param: "cmd".to_string(),
-            value: cmd.to_string(),
-        })?;
-
-        // SAFETY: self.handle() is a valid CtAPI connection handle. cmd is a
-        // GBK-encoded CString whose pointer is valid for this call. The buffer
-        // pointer and length come from async_op which outlives this call.
-        // async_op.overlapped_mut() returns a pointer to the OVERLAPPED struct
-        // that will track the async completion.
-        unsafe {
-            if ctCicode(
-                self.handle(),
-                cmd.as_ptr(),
-                vh_win,
-                mode,
-                async_op.buffer.as_mut_ptr() as *mut i8,
-                async_op.buffer.len() as u32,
-                async_op.overlapped_mut(),
-            ) == 0 {
-                let err = std::io::Error::last_os_error();
-                // ERROR_IO_PENDING (997) is expected for async operations.
-                if err.raw_os_error() != Some(997) {
-                    return Err(err.into());
-                }
-            }
-            Ok(())
-        }
+        let job = cicode_task(self, cmd, vh_win, mode, async_op.buffer_size)?;
+        async_op.start(self, job)
     }
 }
 
-/// Extension trait providing `async`/`await`-compatible operations on
-/// [`CtClient`].
-///
-/// Methods return a [`CtApiFuture`] that drives Windows OVERLAPPED I/O directly,
-/// without requiring `spawn_blocking` or Tokio.
-///
-/// # Examples
-///
-/// ```no_run
-/// use ctapi_rs::{CtClient, FutureCtClient};
-/// use std::sync::Arc;
-///
-/// #[tokio::main]
-/// async fn main() -> anyhow::Result<()> {
-///     let client = Arc::new(CtClient::open(None, None, None, 0)?);
-///
-///     // Fire two Cicode calls concurrently
-///     let (time, date) = tokio::try_join!(
-///         client.cicode_future("Time(1)", 0, 0)?,
-///         client.cicode_future("Date(4)", 0, 0)?,
-///     )?;
-///     println!("{} {}", time, date);
-///     Ok(())
-/// }
-/// ```
-pub trait FutureCtClient {
-    /// Execute a Cicode function and return a [`CtApiFuture`] that can be
-    /// `.await`ed.
-    ///
-    /// The underlying I/O is performed with Windows OVERLAPPED, so no blocking
-    /// thread is required.
-    ///
-    /// # Parameters
-    /// * `cmd`    - Cicode command string.
-    /// * `vh_win` - Window handle, usually `0`.
-    /// * `mode`   - Execution mode flag.
-    ///
-    /// # Errors
-    /// Returns `Err` immediately if the operation cannot be started.
-    ///
-    /// # Examples
-    /// ```no_run
-    /// use ctapi_rs::{CtClient, FutureCtClient};
-    ///
-    /// # async fn run() -> anyhow::Result<()> {
-    /// let client = CtClient::open(None, None, None, 0)?;
-    /// let result = client.cicode_future("Version()", 0, 0)?.await?;
-    /// println!("Version: {}", result);
-    /// # Ok(())
-    /// # }
-    /// ```
-    fn cicode_future(&self, cmd: &str, vh_win: u32, mode: u32) -> Result<CtApiFuture>;
+fn cicode_task(
+    client: &CtClient,
+    cmd: &str,
+    vh_win: u32,
+    mode: u32,
+    buffer_size: usize,
+) -> Result<impl FnOnce() -> Result<String> + Send + use<>> {
+    let cmd = encode_to_gbk_cstring(cmd).map_err(|_| CtApiError::InvalidParameter {
+        param: "cmd".to_owned(),
+        value: cmd.to_owned(),
+    })?;
+    u32::try_from(buffer_size)
+        .map_err(|_| Error::new(ErrorKind::InvalidInput, "Cicode buffer is too large"))?;
+    let client = client.clone();
+    Ok(move || {
+        let mut storage = vec![0; buffer_size.max(1)];
+        let buffer = &mut storage[..buffer_size];
+        client.cicode_into(&cmd, vh_win, mode, buffer)?;
+        if buffer.is_empty() {
+            return Ok(String::new());
+        }
+        extract_string_from_buffer(buffer)
+    })
+}
 
-    /// Write a tag value asynchronously and return a [`CtApiFuture`] that can be
-    /// `.await`ed.
-    ///
-    /// Uses `ctTagWriteEx` with Windows OVERLAPPED I/O internally, so no blocking
-    /// thread is required.
-    ///
-    /// # Parameters
-    /// * `tag`   - Tag name.
-    /// * `value` - Value to write (string form).
-    ///
-    /// # Errors
-    /// Returns `Err` immediately if the operation cannot be started.
-    ///
-    /// # Examples
-    /// ```no_run
-    /// use ctapi_rs::{CtClient, FutureCtClient};
-    ///
-    /// # async fn run() -> anyhow::Result<()> {
-    /// let client = CtClient::open(None, None, None, 0)?;
-    /// client.tag_write_future("Setpoint", "25.5")?.await?;
-    /// # Ok(())
-    /// # }
-    /// ```
+/// Awaitable Cicode and tag write operations.
+pub trait FutureCtClient {
+    /// Submit a Cicode call and return its future.
+    fn cicode_future(&self, cmd: &str, vh_win: u32, mode: u32) -> Result<CtApiFuture>;
+    /// Submit a tag write and return its future.
     fn tag_write_future(&self, tag: &str, value: &str) -> Result<CtApiFuture>;
 }
 
 impl FutureCtClient for CtClient {
     fn cicode_future(&self, cmd: &str, vh_win: u32, mode: u32) -> Result<CtApiFuture> {
-        // Wrap in Arc so CtApiFuture owns a reference that keeps the
-        // CtAPI handle alive for the full lifetime of the future.
-        let client = Arc::new(self.clone());
-        let mut async_op = Box::new(AsyncOperation::new());
-        client.cicode_async(cmd, vh_win, mode, async_op.as_mut())?;
-        Ok(CtApiFuture::from_boxed(&client, async_op))
+        let job = cicode_task(self, cmd, vh_win, mode, DEFAULT_BUFFER_SIZE)?;
+        Ok(CtApiFuture(Work::spawn(job)?))
     }
 
     fn tag_write_future(&self, tag: &str, value: &str) -> Result<CtApiFuture> {
-        let client = Arc::new(self.clone());
-        let mut async_op = Box::new(AsyncOperation::new());
-
-        let tag_cstr = encode_to_gbk_cstring(tag).map_err(|_| CtApiError::InvalidParameter {
-            param: "tag".to_string(),
-            value: tag.to_string(),
-        })?;
-        let value_cstr =
-            encode_to_gbk_cstring(value).map_err(|_| CtApiError::InvalidParameter {
-                param: "value".to_string(),
-                value: value.to_string(),
-            })?;
-
-        // SAFETY: client.handle() is a valid CtAPI connection handle. tag_cstr
-        // and value_cstr are GBK-encoded CStrings valid for this call.
-        // async_op.overlapped_mut() returns a valid OVERLAPPED pointer.
-        unsafe {
-            if !ctTagWriteEx(
-                client.handle(),
-                tag_cstr.as_ptr(),
-                value_cstr.as_ptr(),
-                async_op.as_mut().overlapped_mut(),
-            ) {
-                let err = std::io::Error::last_os_error();
-                // ERROR_IO_PENDING (997) is expected for async operations.
-                if err.raw_os_error() != Some(997) {
-                    return Err(err.into());
-                }
-            }
-        }
-
-        Ok(CtApiFuture::from_boxed(&client, async_op))
+        let tag = encode_to_gbk_cstring(tag)?;
+        let value = encode_to_gbk_cstring(value)?;
+        let client = self.clone();
+        Ok(CtApiFuture(Work::spawn(move || {
+            client
+                .tag_write_encoded(&tag, &value)
+                .map(|()| String::new())
+        })?))
     }
 }
 
 impl FutureCtClient for Arc<CtClient> {
     fn cicode_future(&self, cmd: &str, vh_win: u32, mode: u32) -> Result<CtApiFuture> {
-        // self is &Arc<CtClient> the future stores a clone of this Arc.
-        let mut async_op = Box::new(AsyncOperation::new());
-        (**self).cicode_async(cmd, vh_win, mode, async_op.as_mut())?;
-        Ok(CtApiFuture::from_boxed(self, async_op))
+        (**self).cicode_future(cmd, vh_win, mode)
     }
 
     fn tag_write_future(&self, tag: &str, value: &str) -> Result<CtApiFuture> {
-        let mut async_op = Box::new(AsyncOperation::new());
-
-        let tag_cstr = encode_to_gbk_cstring(tag).map_err(|_| CtApiError::InvalidParameter {
-            param: "tag".to_string(),
-            value: tag.to_string(),
-        })?;
-        let value_cstr =
-            encode_to_gbk_cstring(value).map_err(|_| CtApiError::InvalidParameter {
-                param: "value".to_string(),
-                value: value.to_string(),
-            })?;
-
-        // SAFETY: (**self).handle() is a valid CtAPI connection handle.
-        // tag_cstr and value_cstr are GBK-encoded CStrings valid for this call.
-        unsafe {
-            if !ctTagWriteEx(
-                (**self).handle(),
-                tag_cstr.as_ptr(),
-                value_cstr.as_ptr(),
-                async_op.as_mut().overlapped_mut(),
-            ) {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(997) {
-                    return Err(err.into());
-                }
-            }
-        }
-
-        Ok(CtApiFuture::from_boxed(self, async_op))
+        (**self).tag_write_future(tag, value)
     }
 }
 
-/// A [`Future`] that wraps an in-progress CtAPI OVERLAPPED async list operation.
-///
-/// Created by [`FutureCtList`] methods. Supports `.await` in any async context
-/// without requiring Tokio    a lightweight background thread waits on the
-/// Windows event handle and wakes the task when the operation completes.
-///
-/// # Cancellation
-///
-/// Dropping this future before it resolves will:
-/// 1. Signal the internal waker thread to stop.
-/// 2. Call `ctCancelIO` to cancel the pending I/O operation.
-///
-/// # Thread Safety
-///
-/// `CtListFuture` implements [`Send`] it can be spawned in Tokio tasks or any
-/// other multi-threaded async runtime.
-pub struct CtListFuture {
-    /// Keeps the CtAPI connection alive for the lifetime of this future.
-    client: Arc<CtClient>,
-    async_op: Box<AsyncOperation>,
-    state: Option<Arc<FutureState>>,
-    finished: bool,
-}
-
-impl CtListFuture {
-    fn new(client: Arc<CtClient>, async_op: Box<AsyncOperation>) -> Self {
-        Self {
-            client,
-            async_op,
-            state: None,
-            finished: false,
-        }
-    }
-}
-
-// SAFETY: Arc<CtClient> is Send + Sync. Box<AsyncOperation> is Send.
-// Option<Arc<FutureState>> is auto-Send.
-unsafe impl Send for CtListFuture {}
+/// An awaitable list call that reports the result of the native operation.
+pub struct CtListFuture(Work<()>);
 
 impl Future for CtListFuture {
     type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = self.get_mut();
-
-        if this.async_op.is_complete() {
-            this.finished = true;
-            return Poll::Ready(Ok(()));
-        }
-
-        match &this.state {
-            None => {
-                let state = Arc::new(FutureState {
-                    waker: Mutex::new(Some(cx.waker().clone())),
-                    cancelled: AtomicBool::new(false),
-                });
-                this.state = Some(Arc::clone(&state));
-
-                let win_event = Arc::clone(&this.async_op.win_event);
-                let thread_state = Arc::clone(&state);
-
-                std::thread::Builder::new()
-                    .name("ctapi-list-waker".into())
-                    .spawn(move || {
-                        loop {
-                            if thread_state.cancelled.load(Ordering::Relaxed) {
-                                return;
-                            }
-                            // SAFETY: win_event.handle() is a valid HANDLE from CreateEventA.
-                            let status = unsafe { WaitForSingleObject(win_event.handle(), 100) };
-
-                            if thread_state.cancelled.load(Ordering::Relaxed) {
-                                return;
-                            }
-
-                            if status != WAIT_TIMEOUT {
-                                if let Ok(mut lock) = thread_state.waker.lock()
-                                    && let Some(waker) = lock.take()
-                                {
-                                    waker.wake();
-                                }
-                                return;
-                            }
-                        }
-                    })
-                    .expect("failed to spawn ctapi-list-waker thread");
-            }
-            Some(state) => {
-                if let Ok(mut lock) = state.waker.lock() {
-                    *lock = Some(cx.waker().clone());
-                }
-            }
-        }
-
-        Poll::Pending
+        self.0.poll(cx)
     }
 }
 
-impl Drop for CtListFuture {
-    fn drop(&mut self) {
-        if self.finished {
-            return;
-        }
-        if let Some(state) = &self.state {
-            state.cancelled.store(true, Ordering::Relaxed);
-        }
-        if !self.async_op.is_complete() {
-            // SAFETY: self.client.handle() is a valid CtAPI handle. The OVERLAPPED
-            // pointer is from self.async_op which is Box-allocated and stable.
-            unsafe {
-                let _ = ctCancelIO(self.client.handle(), self.async_op.overlapped_mut());
-            }
-        }
-    }
-}
-
-impl std::fmt::Debug for CtListFuture {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for CtListFuture {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CtListFuture")
-            .field("is_complete", &self.async_op.is_complete())
+            .field("is_complete", &self.0.is_complete())
             .finish()
     }
 }
 
-/// Extension trait providing `async`/`await`-compatible operations on
-/// [`CtList`](crate::CtList).
-///
-/// Methods return a [`CtListFuture`] that drives Windows OVERLAPPED I/O directly,
-/// without requiring `spawn_blocking` or Tokio.
-///
-/// # Implementations
-///
-/// The trait is implemented for both [`CtList`] (by reference) and
-/// [`Arc<CtList>`](std::sync::Arc) so callers can choose whichever fits their
-/// ownership model.
-///
-/// # Examples
-///
-/// ```no_run
-/// use ctapi_rs::{CtClient, FutureCtList};
-/// use std::sync::Arc;
-///
-/// #[tokio::main]
-/// async fn main() -> anyhow::Result<()> {
-///     let client = Arc::new(CtClient::open(None, None, None, 0)?);
-///     let list = Arc::clone(&client).list_new(0)?;
-///     list.add_tag("Temperature")?;
-///     list.add_tag("Pressure")?;
-///
-///     list.read_future()?.await?;
-///     println!("Temp:  {}", list.read_tag("Temperature", 0)?);
-///     println!("Press: {}", list.read_tag("Pressure", 0)?);
-///     Ok(())
-/// }
-/// ```
+/// Awaitable poll-list reads and writes.
 pub trait FutureCtList {
-    /// Read all tags in the list asynchronously and return a [`CtListFuture`]
-    /// that can be `.await`ed.
-    ///
-    /// After this future resolves, call
-    /// [`CtList::read_tag`](crate::CtList::read_tag) to retrieve individual
-    /// values.
-    ///
-    /// # Errors
-    /// Returns `Err` immediately if the operation cannot be started.
+    /// Refresh the list and return its future.
     fn read_future(&self) -> Result<CtListFuture>;
-
-    /// Write a single tag in the list asynchronously and return a
-    /// [`CtListFuture`] that can be `.await`ed.
-    ///
-    /// # Parameters
-    /// * `tag`   - Tag name (must already be added via
-    ///   [`CtList::add_tag`](crate::CtList::add_tag)).
-    /// * `value` - Value string to write.
-    ///
-    /// # Errors
-    /// Returns `Err` immediately if the operation cannot be started.
+    /// Write a list tag and return its future.
     fn write_tag_future(&self, tag: &str, value: &str) -> Result<CtListFuture>;
 }
 
 impl FutureCtList for CtList {
     fn read_future(&self) -> Result<CtListFuture> {
-        let client = self.client_arc();
-        let mut async_op = Box::new(AsyncOperation::new());
-        self.read_async(&mut async_op)?;
-        Ok(CtListFuture::new(client, async_op))
+        let list = self.share();
+        Ok(CtListFuture(Work::spawn(move || list.read())?))
     }
 
     fn write_tag_future(&self, tag: &str, value: &str) -> Result<CtListFuture> {
-        let client = self.client_arc();
-        let mut async_op = Box::new(AsyncOperation::new());
-        self.write_tag_async::<&str, &str>(tag, value, &mut async_op)?;
-        Ok(CtListFuture::new(client, async_op))
+        Ok(CtListFuture(Work::spawn(self.write_task(tag, value)?)?))
     }
 }
 
 impl FutureCtList for Arc<CtList> {
     fn read_future(&self) -> Result<CtListFuture> {
-        let client = self.client_arc();
-        let mut async_op = Box::new(AsyncOperation::new());
-        (**self).read_async(&mut async_op)?;
-        Ok(CtListFuture::new(client, async_op))
+        (**self).read_future()
     }
 
     fn write_tag_future(&self, tag: &str, value: &str) -> Result<CtListFuture> {
-        let client = self.client_arc();
-        let mut async_op = Box::new(AsyncOperation::new());
-        (**self).write_tag_async::<&str, &str>(tag, value, &mut async_op)?;
-        Ok(CtListFuture::new(client, async_op))
+        (**self).write_tag_future(tag, value)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
 
     #[test]
-    fn test_async_operation_creation() {
-        let op = AsyncOperation::new();
-        assert!(!op.win_event.handle().is_null());
-        assert_eq!(op.buffer.len(), 256);
+    fn pending_work_is_bound_to_the_originating_client() {
+        let client = CtClient::from_handle(std::ptr::null_mut());
+        let other_client = CtClient::from_handle(std::ptr::null_mut());
+        let mut operation = AsyncOperation::with_buffer_size(512);
+        let (started, running) = mpsc::channel();
+        let (finish, release) = mpsc::channel();
+        operation
+            .start(&client, move || {
+                started.send(()).unwrap();
+                release.recv().unwrap();
+                Ok("complete".to_owned())
+            })
+            .unwrap();
+        running.recv().unwrap();
+
+        assert!(operation.try_get_result(&client).is_none());
+        assert!(operation.try_get_result(&other_client).unwrap().is_err());
+        assert!(operation.reset().is_err());
+        assert!(operation.cancel(&client).is_err());
+        finish.send(()).unwrap();
+        assert_eq!(operation.get_result(&client.clone()).unwrap(), "complete");
+        operation.reset().unwrap();
+        assert!(operation.is_complete());
     }
 
     #[test]
-    fn test_async_operation_with_buffer_size() {
-        let op = AsyncOperation::with_buffer_size(512);
-        assert!(!op.win_event.handle().is_null());
-        assert_eq!(op.buffer.len(), 512);
+    fn worker_survives_a_dropped_waiter() {
+        let (started, running) = mpsc::channel();
+        let (finish, release) = mpsc::channel();
+        let (completed, result) = mpsc::channel();
+        let work = Work::spawn(move || {
+            started.send(()).unwrap();
+            release.recv().unwrap();
+            completed.send(()).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        running.recv().unwrap();
+        drop(work);
+
+        finish.send(()).unwrap();
+        result.recv().unwrap();
     }
 
-    #[test]
-    fn test_async_operation_reset() {
-        let mut op = AsyncOperation::new();
-        let original_handle = op.win_event.handle();
-        op.buffer[0] = 42;
-        op.reset();
-        // The same underlying event handle should be reused.
-        assert_eq!(original_handle, op.win_event.handle());
-        assert_eq!(op.buffer[0], 0);
-    }
+    #[tokio::test]
+    async fn list_future_returns_worker_success_and_failure() {
+        let success = CtListFuture(Work::spawn(|| Ok(())).unwrap());
+        success.await.unwrap();
 
-    #[test]
-    fn test_async_operation_debug() {
-        let op = AsyncOperation::new();
-        let s = format!("{:?}", op);
-        assert!(s.contains("AsyncOperation"));
-    }
-
-    #[test]
-    fn test_ct_api_future_debug() {
-        fn assert_debug<T: std::fmt::Debug>() {}
-        assert_debug::<CtApiFuture>();
-    }
-
-    #[test]
-    fn test_win_event_arc_sharing() {
-        let op = AsyncOperation::new();
-        // Clone the Arc both references should point to the same handle.
-        let shared = Arc::clone(&op.win_event);
-        assert_eq!(op.win_event.handle(), shared.handle());
-    }
-
-    #[test]
-    fn test_async_operation_is_not_complete_initially() {
-        let op = AsyncOperation::new();
-        // A freshly created (but never started) operation has dwStatus = 0,
-        // which is != STATUS_PENDING (0x103), so is_complete() returns true
-        // until an actual async call is made and sets STATUS_PENDING.
-        // This just verifies the method compiles and returns a bool.
-        let _ = op.is_complete();
+        let failure =
+            CtListFuture(Work::spawn(|| Err(Error::other("test read failure").into())).unwrap());
+        assert_eq!(
+            failure.await.unwrap_err().to_string(),
+            "CtAPI system call failed: test read failure"
+        );
     }
 }

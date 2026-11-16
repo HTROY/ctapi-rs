@@ -25,7 +25,7 @@ pub fn ct_eng_to_raw(value: f64, scale: &CtScale, mode: u32) -> Result<f64> {
     // SAFETY: &mut result is a valid pointer to a stack f64. scale is a valid
     // reference to a CtScale struct. value and mode are primitive values.
     unsafe {
-        if !ctEngToRaw(&mut result, value, scale, mode) {
+        if ctEngToRaw(&mut result, value, scale, mode) == 0 {
             return Err(Error::last_os_error().into());
         }
     }
@@ -54,7 +54,7 @@ pub fn ct_raw_to_eng(value: f64, scale: &CtScale, mode: u32) -> Result<f64> {
     // SAFETY: &mut result is a valid pointer to a stack f64. scale is a valid
     // reference to a CtScale struct. value and mode are primitive values.
     unsafe {
-        if !ctRawToEng(&mut result, value, scale, mode) {
+        if ctRawToEng(&mut result, value, scale, mode) == 0 {
             return Err(Error::last_os_error().into());
         }
     }

@@ -1,18 +1,18 @@
 use ctapi_rs::{AsyncCtClient, AsyncOperation, CtClient};
 use std::sync::Arc;
 
-const COMPUTER: &str = "127.0.0.1";
-const USER: &str = "Engineer";
-const PASSWORD: &str = "Citect";
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("=== Async CtAPI Demo ===\n");
 
+    let computer = std::env::var("CITECT_COMPUTER")?;
+    let user = std::env::var("CITECT_USER")?;
+    let password = std::env::var("CITECT_PASSWORD")?;
+
     let client = Arc::new(CtClient::open(
-        Some(COMPUTER),
-        Some(USER),
-        Some(PASSWORD),
-        0,
+        Some(&computer),
+        Some(&user),
+        Some(&password),
+        ctapi_rs::CT_OPEN_CRYPT,
     )?);
     println!("✓ Connected to Citect SCADA\n");
 
@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Example 2: Polling for completion
     println!("Example 2: Polling for Completion");
-    async_op.reset();
+    async_op.reset()?;
     client.cicode_async("Date(4)", 0, 0, &mut async_op)?;
     println!("  Started async operation...");
 
@@ -102,26 +102,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     println!();
 
+    list_async.get_result(&client)?;
     let value1 = list.read_tag("TagExt_DemoTag1", 0)?;
     let value2 = list.read_tag("TagExt_DemoTag1_Mirror", 0)?;
     println!("  Tag1: {}", value1);
     println!("  Tag2: {}\n", value2);
-
-    // Example 5: Cancellation
-    println!("Example 5: Operation Cancellation");
-    let mut cancel_op = AsyncOperation::new();
-    client.cicode_async("PageDisplay(\"Summary\")", 0, 0, &mut cancel_op)?;
-    println!("  Started long-running operation...");
-
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    // cancel_op.cancel(&client)?;
-    // Wait for completion
-    while !cancel_op.is_complete() {
-        print!(".");
-        std::io::Write::flush(&mut std::io::stdout()).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    println!("  Cancelled operation\n");
 
     println!("=== Demo Complete ===");
     Ok(())

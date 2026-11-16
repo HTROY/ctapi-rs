@@ -41,7 +41,6 @@ On restart, reads `query_checkpoint` for each tag and queries from the saved `la
 ```bash
 cargo run -p alm-sync -- --config config.json
 cargo run -p alm-sync -- --config config.json --once
-cargo run -p alm-sync -- --config config.json --computer 192.168.1.100 --user admin --password secret
 ```
 
 ## Config File
@@ -50,8 +49,7 @@ cargo run -p alm-sync -- --config config.json --computer 192.168.1.100 --user ad
 {
   "scada": {
     "computer": "127.0.0.1",
-    "user": "Engineer",
-    "password": "Citect"
+    "user": "alarm_reader"
   },
   "query": {
     "alarm_type": "AdvAlm",
@@ -65,7 +63,7 @@ cargo run -p alm-sync -- --config config.json --computer 192.168.1.100 --user ad
   },
   "upload": {
     "target": "postgresql",
-    "connection_string": "postgresql://user:pass@localhost/alarms",
+    "connection_string": "postgresql://alarm_writer@db.example/alarms?sslmode=verify-full",
     "batch_size": 100,
     "retry_max": 3,
     "retry_interval_secs": 30
@@ -78,7 +76,7 @@ For MSSQL, use `"target": "mssql"` with an ADO.NET connection string:
 ```json
 "upload": {
   "target": "mssql",
-  "connection_string": "Server=host;Database=db;User Id=user;Password=pass;TrustServerCertificate=true",
+  "connection_string": "Server=db.example,1433;Database=alarms;User ID=alarm_writer;Encrypt=true;TrustServerCertificate=false",
   "batch_size": 100,
   "retry_max": 3,
   "retry_interval_secs": 30
@@ -92,8 +90,21 @@ For MSSQL, use `"target": "mssql"` with an ADO.NET connection string:
 | `--config <path>` | Path to JSON config file (default: `config.json`) |
 | `--computer <host>` | Override SCADA computer address |
 | `--user <name>` | Override SCADA user |
-| `--password <pw>` | Override SCADA password |
 | `--once` | Query once and exit (default: continuous polling) |
+
+## Credentials and transport
+
+Supply the SCADA password through `CITECT_PASSWORD` or a permission-restricted JSON file. The environment value takes precedence. Store database credentials in a restricted connection configuration or use the driver's supported credential provider. Use an account with read-only SCADA access. The client requests CtAPI encryption and read-only mode.
+
+PostgreSQL uploads require TLS with full server identity verification. MSSQL uploads require encryption, server certificate verification, and an explicit database name. Use the hostname covered by the server certificate and configure its trusted CA.
+
+## SQLite state
+
+Set `sqlite.path` to a local filename. A new database is associated with the selected SCADA host and user, and with its upload destination if configured. Use a separate file when either identity changes. Temporarily disabling uploads keeps the existing destination binding.
+
+For an existing database created by an older version, back up the file and check its source and queued destination against the current configuration. Run once with `--adopt-existing-state` to record that verified binding and reconcile duplicate upload entries. Use a new database if the origin is unclear.
+
+An open cursor must enumerate its reported record count. Each completed query window commits its alarms, upload entries, and checkpoint in one transaction. Initial queries cover at most one day and are reduced on exceeding 10,000 records. If a one-second window still exceeds the limit, the sync reports an error and retains the previous checkpoint.
 
 ## Query Fields
 

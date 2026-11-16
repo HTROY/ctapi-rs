@@ -34,9 +34,9 @@ This is a Rust workspace that provides safe bindings to Citect SCADA's CtAPI (Wi
 ### ctapi-rs (safe high-level API)
 - **`client.rs`** — `CtClient` wraps the CtAPI connection handle (`ctOpen`/`ctClose`). Implements `Send + Sync` for `Arc`-based sharing across threads. Provides `tag_read`, `tag_read_ex`, `tag_write`, `tag_write_str`, `cicode`, `find_first`, `list_new`.
 - **`find.rs`** — `CtFind` (iterator over search results) and `FindObject` (property access via `ctFindFirst`/`ctFindNext`/`ctGetProperty`). NOT `Send`/`Sync` — each thread needs its own instance. Holds a `&CtClient` reference and must be dropped before the client.
-- **`list.rs`** — `CtList` manages tag lists for batch read/write via `ctListNew`/`ctListAdd`/`ctListRead`/etc. Holds an `Arc<CtClient>` and is protected by an internal `Mutex`, making it `Send + Sync`. Can be shared across threads via `Arc<CtList>`.
-- **`async_ops.rs`** — Three layers of async: `AsyncOperation` (OVERLAPPED handle), `AsyncCtClient` trait (callback-style), `CtApiFuture` (std `Future` with a waker thread), and `FutureCtClient` trait (returns `CtApiFuture` for `.await`).
-- **`tokio_async.rs`** — `TokioCtClient` (cicode/tag_read/tag_write via `spawn_blocking`), `TokioCtList` (OVERLAPPED read/write with polling). Feature-gated behind `tokio-support`.
+- **`list.rs`** — `CtList` manages tag lists for batch read/write via `ctListNew`/`ctListAdd`/`ctListRead`/etc. Holds an `Arc<CtClient>` and is guards its tag map with an internal RwLock, making it `Send + Sync`. Can be shared across threads via `Arc<CtList>`.
+- **async_ops.rs** — AsyncOperation and Future traits run blocking calls on owned workers.
+- **tokio_async.rs** — TokioCtClient and TokioCtList use spawn_blocking behind tokio-support.
 - **`scaling.rs`** — Engineering unit↔raw value conversion.
 - **`error.rs`** — `CtApiError` enum using `thiserror`.
 - **`constants.rs`** — CtAPI constants (`CT_OPEN_RECONNECT`, buffer sizes, etc.).
@@ -45,17 +45,17 @@ This is a Rust workspace that provides safe bindings to Citect SCADA's CtAPI (Wi
 ### examples/
 - `client` — basic connection and tag operations
 - `list-read` — tag list batch operations
-- `async-demo` — OVERLAPPED-based async usage
+- `async-demo` — Worker-based async usage
 - `tokio-demo` — Tokio async/await (requires `--features tokio-support`)
 
 ## Key Design Decisions
 
 - **GBK encoding**: Citect SCADA uses GBK. Every string parameter is GBK-encoded before FFI; every response buffer is GBK-decoded via `encoding_rs::GBK`.
 - **`tag_write` vs `tag_write_str`**: `tag_write` requires `Display + Add + Sub + Copy` (numeric types). `tag_write_str` accepts any `&str`. The raw FFI is the same — use whichever matches your caller.
-- **Two async models**: `FutureCtClient` (OVERLAPPED-based, no blocking thread — ideal for Cicode) and `TokioCtClient` (spawn_blocking — needed for tag_read/write which don't support OVERLAPPED). `TokioCtList` uses OVERLAPPED with polling.
-- **Thread safety**: `CtClient` and `CtList` are both `Send + Sync`. `CtClient` is safe because CtAPI.dll is documented thread-safe. `CtList` uses an internal `Mutex` to serialize all FFI calls. `CtFind` borrows `&CtClient` and is NOT `Send`/`Sync` — each thread needs its own instance.
-- **Tests use env vars**: `CITECT_COMPUTER`, `CITECT_USER`, `CITECT_PASSWORD` for connection params. All integration tests are `#[ignore]`d by default since they need a live SCADA system.
-- **CtClient derives Clone + PartialEq**: cloning increments an internal CtAPI reference count (same underlying handle). `Drop` calls `ctClose`. The `PartialEq` compares raw handles.
+- **Async lifetime**: See ASYNC_IMPLEMENTATION.md when changing worker ownership, result collection, or cancellation.
+- **Thread safety**: `CtClient` and `CtList` are both `Send + Sync`. `CtClient` is safe because CtAPI.dll is documented thread-safe. `CtList` uses an RwLock to guard its tag map. `CtFind` borrows `&CtClient` and is NOT `Send`/`Sync` — each thread needs its own instance.
+See TEST_CONFIGURATION.md for the SCADA fixture environment.
+- **Client ownership**: CtClient clones share one Rust owner that closes the native handle after the last clone drops.
 
 ## Changelog
 

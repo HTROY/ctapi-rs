@@ -26,7 +26,7 @@ cargo run --example tokio-demo
 
 ## Testing
 
-Integration tests use env vars: `CITECT_COMPUTER`, `CITECT_USER`, `CITECT_PASSWORD`. Defaults to `192.168.1.12` / `Manager` / `Citect`.
+For SCADA integration tests, supply CITECT_COMPUTER, CITECT_USER, and CITECT_PASSWORD from the test environment. See TEST_CONFIGURATION.md.
 
 ## quirks
 

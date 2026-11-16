@@ -9,7 +9,7 @@
 //! - Object search and property retrieval
 //! - Tag list management
 //! - Engineering units and raw value conversion
-//! - Asynchronous operations with OVERLAPPED I/O
+//! - Asynchronous operations on owned workers
 
 pub mod async_ops;
 pub mod client;
@@ -26,7 +26,7 @@ pub mod tokio_async;
 pub use crate::async_ops::{
     AsyncCtClient, AsyncOperation, CtApiFuture, CtListFuture, FutureCtClient, FutureCtList,
 };
-pub use crate::client::{ct_client_create, ct_client_destroy, CtClient};
+pub use crate::client::{CtClient, ct_client_create, ct_client_destroy};
 pub use crate::constants::*;
 pub use crate::error::CtApiError;
 pub use crate::find::{CtFind, FindObject};
@@ -37,9 +37,9 @@ pub use crate::scaling::{ct_eng_to_raw, ct_raw_to_eng};
 pub use crate::tokio_async::{TokioCtClient, TokioCtList};
 
 // re-export commonly used types from ctapi_sys
+pub use crate::client::CtTagValueItems;
 pub use ctapi_sys::CtHScale;
 pub use ctapi_sys::CtScale;
-pub use ctapi_sys::CtTagValueItems;
 
 #[cfg(test)]
 mod tests {
@@ -50,7 +50,7 @@ mod tests {
 
     /// Helper function to get connection parameters from environment variables
     /// Returns None for each parameter if the corresponding environment variable is not set
-    fn get_connection_params() -> (Option<String>, Option<String>, Option<String>) {
+    pub(super) fn get_connection_params() -> (Option<String>, Option<String>, Option<String>) {
         let computer = std::env::var("CITECT_COMPUTER").ok();
         let user = std::env::var("CITECT_USER").ok();
         let password = std::env::var("CITECT_PASSWORD").ok();

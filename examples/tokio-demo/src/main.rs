@@ -2,7 +2,7 @@
 //!
 //! This example demonstrates how to use ctapi-rs with Tokio's async/await runtime,
 //! including both the `spawn_blocking`-based `TokioCtClient` API and the new
-//! OVERLAPPED-based `FutureCtClient` API.
+//! Future-based `FutureCtClient` API.
 //!
 //! Note: This demo will fail to connect without a running Citect SCADA instance.
 
@@ -15,7 +15,15 @@ async fn main() -> anyhow::Result<()> {
     println!("=== Tokio CtAPI Demo ===\n");
 
     // Connect to Citect SCADA
-    let client = match CtClient::open(Some("127.0.0.1"), Some("Engineer"), Some("Citect"), 0) {
+    let computer = std::env::var("CITECT_COMPUTER")?;
+    let user = std::env::var("CITECT_USER")?;
+    let password = std::env::var("CITECT_PASSWORD")?;
+    let client = match CtClient::open(
+        Some(&computer),
+        Some(&user),
+        Some(&password),
+        ctapi_rs::CT_OPEN_CRYPT,
+    ) {
         Ok(c) => {
             println!("✓ Connected to Citect SCADA\n");
             Arc::new(c)
@@ -27,7 +35,6 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let client = Arc::new(client);  
     // ── Demo 1: Simple async/await calls (spawn_blocking) ──────────────────
     println!("Demo 1: Simple async/await calls (spawn_blocking)");
     println!("--------------------------------------------------");
@@ -36,8 +43,8 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => eprintln!("✗ Demo 1 failed: {}\n", e),
     }
 
-    // ── Demo 2: OVERLAPPED-native Future (no spawn_blocking) ───────────────
-    println!("Demo 2: OVERLAPPED-native Future (FutureCtClient)");
+    // ── Demo 2: Runtime-independent Future (no spawn_blocking) ───────────────
+    println!("Demo 2: Runtime-independent Future (FutureCtClient)");
     println!("--------------------------------------------------");
     match demo_future_client(&client.clone()).await {
         Ok(_) => println!("✓ Demo 2 completed\n"),
@@ -93,15 +100,15 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Demo 9: Mix FutureCtClient with try_join! ──────────────────────────
-    println!("Demo 9: Concurrent OVERLAPPED futures via try_join!");
+    println!("Demo 9: Concurrent futures via try_join!");
     println!("----------------------------------------------------");
     match demo_concurrent_futures(&client.clone()).await {
         Ok(_) => println!("✓ Demo 9 completed\n"),
         Err(e) => eprintln!("✗ Demo 9 failed: {}\n", e),
     }
 
-    // ── Demo 10: FutureCtList — OVERLAPPED list read/write ───────────────────
-    println!("Demo 10: FutureCtList — OVERLAPPED-based list operations");
+    // ── Demo 10: FutureCtList — worker-based list read/write ───────────────────
+    println!("Demo 10: FutureCtList — Future-based list operations");
     println!("----------------------------------------------------------");
     match demo_future_list(&client.clone()).await {
         Ok(_) => println!("✓ Demo 10 completed\n"),
@@ -128,16 +135,15 @@ async fn demo_simple_async(client: &Arc<CtClient>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Demo 2: The `FutureCtClient` trait drives Windows OVERLAPPED I/O directly,
-/// so no blocking thread is consumed per call.
+/// Demo 2: FutureCtClient runs Cicode on an owned worker.
 async fn demo_future_client(client: &Arc<CtClient>) -> anyhow::Result<()> {
     // cicode_future() returns a CtApiFuture that implements std::future::Future.
     // It can be .await-ed just like any other future.
     let time = client.cicode_future("Time(1)", 0, 0)?.await?;
-    println!("  Time (OVERLAPPED) : {}", time);
+    println!("  Time (Future) : {}", time);
 
     let date = client.cicode_future("Date(4)", 0, 0)?.await?;
-    println!("  Date (OVERLAPPED) : {}", date);
+    println!("  Date (Future) : {}", date);
 
     Ok(())
 }
@@ -226,7 +232,7 @@ async fn demo_list_operations(client: &Arc<CtClient>) -> anyhow::Result<()> {
     }
     println!("  Added {} tags to list", tags.len());
 
-    // Non-blocking read — polls OVERLAPPED status with tokio::time::sleep.
+    // Tokio runs the native call in the blocking pool.
     list.read_tokio().await?;
     println!("  Read complete:");
 
@@ -278,7 +284,7 @@ async fn demo_timeout_handling(client: &Arc<CtClient>) -> anyhow::Result<()> {
         Err(_) => eprintln!("  timed out after 2 s"),
     }
 
-    // Same pattern with FutureCtClient — OVERLAPPED future also supports timeout.
+    // Same pattern with FutureCtClient — the future can also stop waiting on timeout.
     match timeout(
         Duration::from_secs(2),
         client.cicode_future("Date(4)", 0, 0)?,
@@ -293,8 +299,8 @@ async fn demo_timeout_handling(client: &Arc<CtClient>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Demo 9: Use `tokio::try_join!` with OVERLAPPED futures to run two Cicode
-/// calls truly concurrently without any blocking threads.
+/// Demo 9: Use `tokio::try_join!` with Cicode futures to run two Cicode
+/// calls on separate worker threads.
 async fn demo_concurrent_futures(client: &Arc<CtClient>) -> anyhow::Result<()> {
     // cicode_future() returns a CtApiFuture (std::future::Future).
     // try_join! polls both futures concurrently on the same thread.
@@ -311,10 +317,7 @@ async fn demo_concurrent_futures(client: &Arc<CtClient>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Demo 10: `FutureCtList` drives list read/write with Windows OVERLAPPED I/O,
-/// just like `FutureCtClient` does for Cicode calls.  No `spawn_blocking` is
-/// needed — a lightweight waker thread signals the future when the OVERLAPPED
-/// event completes.
+/// Demo 10: Await list reads and writes on owned workers.
 async fn demo_future_list(client: &Arc<CtClient>) -> anyhow::Result<()> {
     let list = Arc::clone(client).list_new(0)?;
 
@@ -324,9 +327,9 @@ async fn demo_future_list(client: &Arc<CtClient>) -> anyhow::Result<()> {
     }
     println!("  Added {} tags to list", tags.len());
 
-    // ── OVERLAPPED-based read (no spawn_blocking) ─────────────────────────
+    // ── Future-based read (no spawn_blocking) ─────────────────────────
     list.read_future()?.await?;
-    println!("  Read complete (OVERLAPPED):");
+    println!("  Read complete (Future):");
 
     for tag in &tags {
         match list.read_tag(tag, 0) {
@@ -335,9 +338,9 @@ async fn demo_future_list(client: &Arc<CtClient>) -> anyhow::Result<()> {
         }
     }
 
-    // ── OVERLAPPED-based write ────────────────────────────────────────────
+    // ── Future-based write ────────────────────────────────────────────
     list.write_tag_future("BIT_1", "1")?.await?;
-    println!("  Wrote BIT_1 = 1 via OVERLAPPED  ✓");
+    println!("  Wrote BIT_1 = 1 via Future  ✓");
 
     // Verify
     list.read_future()?.await?;
@@ -346,10 +349,7 @@ async fn demo_future_list(client: &Arc<CtClient>) -> anyhow::Result<()> {
 
     // ── Concurrent read + write via try_join! ─────────────────────────────
     println!("  Concurrent read + write via try_join!:");
-    let ((), ()) = tokio::try_join!(
-        list.read_future()?,
-        list.write_tag_future("BIT_1", "0")?,
-    )?;
+    let ((), ()) = tokio::try_join!(list.read_future()?, list.write_tag_future("BIT_1", "0")?,)?;
     println!("  Concurrent ops completed  ✓");
 
     Ok(())

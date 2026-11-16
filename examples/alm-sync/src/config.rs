@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Config {
     pub scada: ScadaConfig,
     pub query: QueryConfig,
@@ -8,7 +8,7 @@ pub struct Config {
     pub upload: Option<UploadConfig>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct ScadaConfig {
     pub computer: String,
     pub user: String,
@@ -16,7 +16,7 @@ pub struct ScadaConfig {
     pub password: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct QueryConfig {
     pub alarm_type: String,
     #[serde(default)]
@@ -41,19 +41,27 @@ impl Default for QueryConfig {
     }
 }
 
-fn default_period() -> f64 { 0.001 }
-fn default_lookback_days() -> i64 { 80 }
-fn default_poll_interval_secs() -> u64 { 300 }
+fn default_period() -> f64 {
+    0.001
+}
+fn default_lookback_days() -> i64 {
+    80
+}
+fn default_poll_interval_secs() -> u64 {
+    300
+}
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct SqliteConfig {
     #[serde(default = "default_sqlite_path")]
     pub path: String,
 }
 
-fn default_sqlite_path() -> String { "alarms.db".into() }
+fn default_sqlite_path() -> String {
+    "alarms.db".into()
+}
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct UploadConfig {
     /// "postgresql" or "mssql"
     pub target: String,
@@ -66,6 +74,12 @@ pub struct UploadConfig {
     pub retry_interval_secs: u64,
 }
 
-fn default_batch_size() -> usize { 100 }
-fn default_retry_max() -> u32 { 3 }
-fn default_retry_interval_secs() -> u64 { 30 }
+fn default_batch_size() -> usize {
+    100
+}
+fn default_retry_max() -> u32 {
+    3
+}
+fn default_retry_interval_secs() -> u64 {
+    30
+}

@@ -1,4 +1,4 @@
-﻿//! Tokio async runtime integration
+//! Tokio async runtime integration
 //!
 //! This module provides integration with the Tokio async runtime, allowing
 //! CtAPI operations to be used with Rust's `async`/`await` syntax via
@@ -17,10 +17,6 @@
 //! The Citect SCADA C API is inherently blocking. Each method in this module
 //! offloads the blocking call to Tokio's blocking-thread pool via
 //! `spawn_blocking`, leaving the async runtime free to drive other tasks.
-//!
-//! For operations that natively support Windows OVERLAPPED I/O (e.g. Cicode),
-//! consider [`FutureCtClient`](crate::FutureCtClient) instead it avoids a
-//! dedicated thread entirely.
 //!
 //! # Examples
 //!
@@ -43,10 +39,8 @@
 //! ```
 
 use crate::error::Result;
-use crate::{AsyncOperation, CtClient, CtList, CtTagValueItems};
-use ctapi_sys::ctGetOverlappedResult;
+use crate::{CtClient, CtList, CtTagValueItems};
 use std::sync::Arc;
-use windows_sys::Win32::System::Threading::WaitForSingleObject;
 
 // ----------------------------------------------------------------------------------------------
 // TokioCtClient
@@ -247,14 +241,8 @@ impl TokioCtClient for Arc<CtClient> {
 /// # Thread Safety
 ///
 /// [`CtList`] is `Send + Sync` and can be safely shared across threads via
-/// `Arc<CtList>`.  Two implementations are provided:
-///
-/// - **`impl TokioCtList for CtList`** uses Windows OVERLAPPED I/O with
-///   polling; best for single-task usage where the list is owned by one async
-///   context.
-/// - **`impl TokioCtList for Arc<CtList>`** offloads the blocking call to
-///   Tokio's blocking-thread pool via [`tokio::task::spawn_blocking`]; best
-///   when the same list is shared across multiple Tokio tasks.
+/// `Arc<CtList>`.
+/// CtList methods dispatch owned calls to the Tokio blocking pool.
 ///
 /// # Examples
 ///
@@ -266,7 +254,7 @@ impl TokioCtClient for Arc<CtClient> {
 /// async fn main() -> anyhow::Result<()> {
 ///     let client = Arc::new(CtClient::open(None, None, None, 0)?);
 ///
-///     // Single-task usage (OVERLAPPED I/O, no extra thread)
+///     // Use a list through the Tokio blocking pool
 ///     let list = Arc::clone(&client).list_new(0)?;
 ///     list.add_tag("Temperature")?;
 ///     list.add_tag("Pressure")?;
@@ -274,7 +262,7 @@ impl TokioCtClient for Arc<CtClient> {
 ///     println!("Temp:  {}", list.read_tag("Temperature", 0)?);
 ///     println!("Press: {}", list.read_tag("Pressure",    0)?);
 ///
-///     // Multi-task usage via Arc (spawn_blocking)
+///     // Share a list across tasks with Arc
 ///     let shared = Arc::new(Arc::clone(&client).list_new(0)?);
 ///     shared.add_tag("FlowRate")?;
 ///     let shared2 = Arc::clone(&shared);
@@ -299,103 +287,24 @@ pub trait TokioCtList {
     async fn write_tag_tokio(&self, tag: &str, value: &str) -> Result<()>;
 }
 
-/// OVERLAPPED-based implementation for owned/borrowed `CtList`.
-///
-/// Uses Windows OVERLAPPED I/O with event-driven wake via the OVERLAPPED
-/// event handle. A single Tokio blocking thread waits on the event and
-/// returns as soon as the operation completes no polling latency.
-/// Suitable for single-task contexts.
 impl TokioCtList for CtList {
     async fn read_tokio(&self) -> Result<()> {
-        // Box the AsyncOperation before starting so the OVERLAPPED struct
-        // lives at a stable heap address. CtAPI stores a raw pointer to it
-        // and writes completion data there moving `op` after read_async
-        // would leave CtAPI with a dangling pointer.
-        let mut op = Box::new(AsyncOperation::new());
-        self.read_async(&mut op)
-            .map_err(|e| crate::error::CtApiError::System(e))?;
-
-        // Keep the Arc alive so the CtAPI handle stays valid across the blocking thread.
-        let client = self.client_arc();
-
-        tokio::task::spawn_blocking(move || {
-            // SAFETY: op owns the WinEvent handle. WaitForSingleObject with
-            // INFINITE blocks until the OVERLAPPED operation signals the event.
-            unsafe { WaitForSingleObject(op.win_event_handle(), u32::MAX) };
-            // SAFETY: client_handle is valid (kept alive by `client` Arc).
-            // op.overlapped_mut() is a stable heap pointer.  We call
-            // ctGetOverlappedResult with bWait=false because the event has
-            // already been signalled above.
-            unsafe {
-                let mut transferred = 0;
-                if !ctGetOverlappedResult(
-                    client.handle(),
-                    op.overlapped_mut(),
-                    &mut transferred,
-                    false,
-                ) {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| crate::error::CtApiError::System(e))?
+        let list = self.share();
+        spawn_blocking_result(move || list.read()).await
     }
 
     async fn write_tag_tokio(&self, tag: &str, value: &str) -> Result<()> {
-        let mut op = Box::new(AsyncOperation::new());
-        self.write_tag_async::<&str, &str>(tag, value, &mut op)
-            .map_err(|e| crate::error::CtApiError::System(e))?;
-
-        let client = self.client_arc();
-
-        tokio::task::spawn_blocking(move || {
-            unsafe { WaitForSingleObject(op.win_event_handle(), u32::MAX) };
-            unsafe {
-                let mut transferred = 0;
-                if !ctGetOverlappedResult(
-                    client.handle(),
-                    op.overlapped_mut(),
-                    &mut transferred,
-                    false,
-                ) {
-                    return Err(std::io::Error::last_os_error().into());
-                }
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|e| crate::error::CtApiError::System(e))?
+        spawn_blocking_result(self.write_task(tag, value)?).await
     }
 }
 
-/// `spawn_blocking`-based implementation for `Arc<CtList>`.
-///
-/// Offloads the blocking CtAPI call to Tokio's blocking-thread pool, keeping
-/// the async runtime responsive.  Use this variant when a `CtList` is shared
-/// across multiple Tokio tasks.
 impl TokioCtList for Arc<CtList> {
     async fn read_tokio(&self) -> Result<()> {
-        let list = Arc::clone(self);
-        spawn_blocking_result(move || {
-            list.read().map_err(|e| crate::error::CtApiError::System(e))
-        })
-        .await
+        (**self).read_tokio().await
     }
 
     async fn write_tag_tokio(&self, tag: &str, value: &str) -> Result<()> {
-        let list = Arc::clone(self);
-        let tag = tag.to_string();
-        let value = value.to_string();
-        spawn_blocking_result(move || {
-            list.write_tag(&tag, &value)
-                .map_err(|e| crate::error::CtApiError::Other {
-                    code: 0,
-                    message: e.to_string(),
-                })
-        })
-        .await
+        (**self).write_tag_tokio(tag, value).await
     }
 }
 
@@ -408,12 +317,17 @@ where
 {
     tokio::task::spawn_blocking(f)
         .await
-        .map_err(|e| crate::error::CtApiError::System(e))?
+        .map_err(|e| crate::error::CtApiError::System(e.into()))?
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn open_test_client() -> CtClient {
+        let (computer, user, password) = crate::tests::get_connection_params();
+        CtClient::open(computer.as_deref(), user.as_deref(), password.as_deref(), 0).unwrap()
+    }
 
     /// Ensure the module compiles and basic trait bounds are satisfied.
     #[tokio::test]
@@ -429,9 +343,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "Requires actual Citect SCADA connection"]
     async fn test_arc_client_trait() {
-        let client = Arc::new(
-            CtClient::open(Some("127.0.0.1"), Some("Engineer"), Some("Citect"), 0).unwrap(),
-        );
+        let client = Arc::new(open_test_client());
 
         // Both Arc<CtClient> and CtClient impl TokioCtClient
         let _v1 = client.tag_read_tokio("BIT_1").await.unwrap();
@@ -441,9 +353,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "Requires actual Citect SCADA connection"]
     async fn test_concurrent_reads() {
-        let client = Arc::new(
-            CtClient::open(Some("127.0.0.1"), Some("Engineer"), Some("Citect"), 0).unwrap(),
-        );
+        let client = Arc::new(open_test_client());
 
         let tags = ["BIT_1", "BIT_2", "BIT_3"];
         let mut handles = vec![];
@@ -463,8 +373,7 @@ mod tests {
     #[tokio::test]
     #[ignore = "Requires actual Citect SCADA connection"]
     async fn test_tag_read_ex_tokio() {
-        let client =
-            CtClient::open(Some("127.0.0.1"), Some("Engineer"), Some("Citect"), 0).unwrap();
+        let client = open_test_client();
         let (value, meta) = client.tag_read_ex_tokio("BIT_1").await.unwrap();
         println!("value={} quality={}", value, meta.quality_general);
     }
@@ -474,10 +383,9 @@ mod tests {
     async fn test_future_client_with_tokio() {
         use crate::FutureCtClient;
 
-        let client =
-            CtClient::open(Some("127.0.0.1"), Some("Engineer"), Some("Citect"), 0).unwrap();
+        let client = open_test_client();
 
-        // FutureCtClient uses OVERLAPPED --?compare result with spawn_blocking approach.
+        // Compare the owned worker and Tokio blocking-pool adapters.
         let future_result = client.cicode_future("Time(1)", 0, 0).unwrap().await;
         let blocking_result = client.cicode_tokio("Time(1)", 0, 0).await;
 
@@ -485,4 +393,3 @@ mod tests {
         println!("blocking: {:?}", blocking_result);
     }
 }
-
